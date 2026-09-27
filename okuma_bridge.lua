@@ -1,5 +1,5 @@
 --[[ ==========================================================================
-  okuma interactive — TouchOSC bridge  v1
+  okuma interactive — TouchOSC bridge  v2
   OSC in (ESP32 modules)  ->  normalised MIDI CC out (channel 1)
 
     /okuma/cup1 .. cup4   raw HX711 counts     ->  CC 20 .. 23
@@ -15,7 +15,12 @@
     snap   : within ±x % of the empty-cup weight around a captured point, the
              output locks exactly to 127 / 0 / 63 (kills drift + jitter)
     smooth : extra smoothing time constant here (0 = off, max 1 s)
-    Tea heavier than the TEA point keeps rising above 63 (clamped at 127).
+    Anything heavier than the TEA point stays at 63 (capped).
+
+  MANUAL — the output faders are touchable, for MIDI work without sensors.
+    While a fader is held the sensor never overwrites it; on release it
+    snaps back to the sensor value (if a sensor is sending), otherwise it
+    stays where you left it.
 
   TILT — 0° -> 0, range° -> 127 (range fader, 10 … 180°, 5° steps, default 90).
 
@@ -96,7 +101,7 @@ local function mapCup(i, v)
   if w <= 0 then return 1 end
   if w < 1 then return 1 - w end
   if not wF then return 0 end
-  return math.clamp(TEA * (w - 1) / (wF - 1), 0, 1)
+  return math.clamp(TEA * (w - 1) / (wF - 1), 0, TEA)   -- capped at 63
 end
 
 local function captureValue(c)
@@ -115,7 +120,7 @@ local function tiltRange()
 end
 
 local function applyTilt()
-  if not tilt.deg then return end
+  if not tilt.deg or ui.tiltOut.values.touch then return end   -- held = manual
   local out = math.clamp(tilt.deg / tiltRange(), 0, 1)
   if ui.tiltOut.values.x ~= out then ui.tiltOut.values.x = out end
 end
@@ -133,7 +138,9 @@ local function refreshUi(now)
       setText(u.raw, string.format('raw %.0f   %s', c.raw, st))
     end
 
-    if not (c.N and c.E) then
+    if u.out.values.touch or not c.target then
+      setText(u.outval, string.format('MIDI %d   manual', math.floor(u.out.values.x * 127 + 0.5)))
+    elseif not (c.N and c.E) then
       setText(u.outval, 'capture NO CUP + EMPTY')
     elseif c.N == c.E then
       setText(u.outval, 'NO CUP = EMPTY ?')
@@ -163,11 +170,12 @@ local function refreshUi(now)
   if tilt.deg then
     local age = now - tilt.last
     setText(ui.tiltDeg, string.format('%.1f°   %s', tilt.deg, age < LIVE_MS and 'live' or 'no data'))
-    setText(ui.tiltVal, string.format('MIDI %d', math.floor(ui.tiltOut.values.x * 127 + 0.5)))
   else
     setText(ui.tiltDeg, '—   waiting')
-    setText(ui.tiltVal, 'MIDI —')
   end
+  local manual = ui.tiltOut.values.touch or not tilt.deg
+  setText(ui.tiltVal, string.format('MIDI %d%s', math.floor(ui.tiltOut.values.x * 127 + 0.5),
+                                    manual and '   manual' or ''))
   setText(ui.rangeLbl, string.format('0 … %d°', tiltRange()))
 end
 
@@ -256,7 +264,14 @@ function update()
 
   for i = 1, CUPS do
     local c = cups[i]
-    if c.target then
+    local held = ui[i].out.values.touch
+    if held then
+      c.manual = true
+    elseif c.manual then
+      c.manual = false
+      c.out = nil                     -- released: hand the fader back to the sensor
+    end
+    if c.target and not held then
       local tau = ui[i].smooth.values.x * SMOOTH_MAX
       if tau <= 0.001 then
         c.raw = c.target
