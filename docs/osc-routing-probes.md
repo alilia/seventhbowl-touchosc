@@ -3,7 +3,7 @@
 Question: how does incoming OSC reach the scripts, and does v4's "backup OSC route" (receiver labels → root:notify) cause double handling?
 
 Setup: load-cells-v2 firmware unchanged, only cup1 connected (/okuma/cup1, ESP32) → TouchOSC on Windows, OSC UDP receive port 10000. TouchOSC version: not recorded.
-Files: `probes/` — `build_osc_probes.py` (A/B/C, `--receiver /okuma/cup1` for the cup1 variants), `make_probe_d.py` (real layout + handleOsc counter; `--template okuma_bridge.template.lua`).
+Files (removed after v4, they use that builder's helpers; see the v4 commit): `build_osc_probes.py` (A/B/C, `--receiver /okuma/cup1` for the cup1 variants), `make_probe_d.py` (real layout + handleOsc counter; `--template okuma_bridge.template.lua`).
 
 | probe | root got cup1 | label got cup1 | counts (root / label) | notes |
 |---|---|---|---|---|

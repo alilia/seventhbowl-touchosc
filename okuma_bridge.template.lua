@@ -1,8 +1,11 @@
 --[[ ==========================================================================
-  okuma interactive — TouchOSC bridge  v4
+  Seventh Bowl — TouchOSC bridge  v5
   OSC in (ESP32 modules)  ->  MIDI out
 
-  v4 = v3 structure + Greg's v12 fill behaviour, lift CCs and round notes.
+  v5 = v4 + fill by EVENTS instead of by weight (the weight of a load cell
+  depends on where the vessel stands, so the number can't be trusted for the
+  level), steps stored as offsets from the live NO point, tare whenever the
+  scale is empty and still.
 
   This file is a TEMPLATE. build_okuma_layout.py replaces the CONFIG marker
   below with the sensor list and settings from its own config section, then
@@ -20,38 +23,54 @@
     newModule    shared parts of every accessory (battery, manual fader,
                  MIDI text). Called first by the constructors below.
     newLoadCell  gaiwan + cups.
-                 CALIBRATION: three captured points — NO <OBJECT>, EMPTY,
-                 WITH TEA. They define the weight scale; they are not MIDI
-                 values any more.
-                 FILL (CC, from v12): EMPTY -> EMPTY_MIDI (0) … WITH TEA ->
-                 FULL_MIDI (127), linear between, capped at FULL.
-                 snap   = lock zone around EMPTY / WITH TEA (± % of empty weight)
+                 CALIBRATION (captured once, vessel in the MIDDLE of its place):
+                   NO     the empty scale  -> N, kept LIVE (drifts, tared)
+                   EMPTY  the empty vessel -> stored as a STEP above NO (dE)
+                   TEA    vessel with tea  -> stored as a STEP above EMPTY (dF)
+                 Steps, not absolute values: drift moves the whole curve, so a
+                 tare (new NO) moves all three points together.
+                 WEIGHT w = (reading - N) / dE : 0 = nothing, 1 = empty vessel.
+                 It is only used to see EVENTS (arrive / lift / pour); it is
+                 never mapped to the level, because a load cell reads very
+                 differently depending on where the vessel stands.
+                 FILL (the CC) is a stored 0..1 level changed by events:
+                   POUR     while standing, the weight rises by POUR_FRACTION of
+                            the tea step and stays still for FULL_HOLD_S
+                            -> fill = 100 %  (and the gaiwan tells the rounds)
+                   SIP      the vessel was off the scale for at least MIN_LIFT_S
+                            and comes back -> fill - `sip` (cups 0.33: three
+                            sips; the gaiwan 1.0: empty). Never goes up on a
+                            return. Capped 0..100 %.
+                   `pour_on_return` (gaiwan): a lid-off refill comes back
+                            heavier than it left -> counts as a pour.
+                 The CC HOLDS while the vessel is lifted; after a put-down a
+                 lower fill glides down over FALL_S, a higher one follows with
+                 RISE_TAU. The LIFT CC ramps 0 <-> 127 over LIFT_RISE_S (up) and
+                 LIFT_FALL_S (down); it is a target (self.lifted) with a moving output.
+                 snap   = "off the scale" band (± % of the empty step, default 50 %):
+                          below it the vessel is away (sip / lift), above it present
+                 WOBBLE (v5 fix 1): vessels stand only roughly in the middle, so
+                 the same vessel reads differently after every put-down. Every
+                 event is therefore measured from where the vessel settled THIS
+                 time (the base), never from the captured numbers, and the pour
+                 threshold shrinks for a spot that reads light (seat < 1).
                  smooth = extra smoothing of the raw sensor (time constant)
                  LIFT / PUT DOWN (state machine from v3):
                    none     nothing on the scale
                    present  a vessel is resting
                    transit  something is arriving/leaving; becomes none /
                             present once the weight has been still for SETTLE_MS
-                 A vessel on the scale can only get LIGHTER by being lifted
-                 (tea does not leave a cup that stays put), so a drop of more
-                 than LIFT_DROP below the settled weight = lifted, at once.
-                 Speed plays no role.
-                 OUTPUT while not 'present' (lifted, placing, empty scale):
-                   the fill CC HOLDS its last value; the LIFT CC says 127.
-                 Once a vessel has settled again ('present'), LIFT CC = 0 and:
-                   less tea than before -> the fill glides DOWN linearly,
-                                           the whole drop takes FALL_S
-                   more tea (pouring)   -> it follows UP with RISE_TAU smoothing
-                 LIFT TOGGLE under each column mirrors the lift CC (lit =
-                 lifted). It carries the CC itself, so tapping it by hand sends
-                 the CC too; the sensor overwrites it only at its next
-                 lift / put-down.
-                 FULL (rounds): every time a vessel settles at the tea point
-                 (ROUND_FULL_AT of the way from empty to tea) the module named
-                 in `rounds` is told. It re-arms when the weight has dropped
-                 below ROUND_REARM_AT of the way, or the vessel was lifted /
-                 the scale was empty — so a refill off the scale counts too.
-    newRounds    round counter. +1 each time the gaiwan is full; starts at 0.
+                 A vessel on the scale can only get LIGHTER by being lifted, so a
+                 drop of more than LIFT_DROP below the settled weight = lifted.
+                 The lift CC says 127 whenever the state is not 'present'.
+                 LIFT TOGGLE under each column mirrors the lift CC (lit = lifted);
+                 it carries the CC itself, so tapping it by hand sends it too.
+                 TARE (v5 fix 1): whenever the scale is off (vessel away), within
+                 the tare band (TARE_BAND, the gaiwan its own `tare_band` so a lid
+                 alone is never tared) and still for TARE_HOLD_S, NO takes that
+                 reading. That includes every round start and every long sip. It
+                 does not interrupt a lift in progress.
+    newRounds    round counter. +1 each time tea is poured into the gaiwan; starts at 0.
                  Sent as a MIDI CC (the count itself, 0–127) AND as a short
                  note (from v12, for Ableton Session scene launch):
                    note = ROUND_NOTE + count   (count 0 = reset note)
@@ -95,7 +114,7 @@
   check TouchOSC's own log.
 
   CALIBRATION is kept while the layout runs and mirrored into the root
-  group's tag ("id=N,E,F;id=…"), which is read back on start (v3 tags work).
+  group's tag ("id=v5:N,dE,dF,fill;id=…"), read back on start (v4 tags "N,E,F" and v3 tags work).
 ========================================================================== ]]
 
 --@@CONFIG@@
@@ -106,7 +125,6 @@ local CAPTURE_MS     = 1000    -- capture = mean of readings in this window
 local LIVE_MS        = 2000    -- "live" if a value arrived within this time
 local BATTERY_OLD_MS = 30000   -- battery reading counts as old after this
 local UI_EVERY_MS    = 150     -- text refresh rate
-local ROUND_NOTE_MS  = 150     -- length of the round note
 
 -- connection list for sendMIDI: only MIDI_CONNECTION is on
 local MIDI_CONN = {}
@@ -115,7 +133,8 @@ for i = 1, 10 do MIDI_CONN[i] = (i == MIDI_CONNECTION) end
 -- ---------------------------------------------------------------------------
 --  helpers
 -- ---------------------------------------------------------------------------
-local saveAll   -- defined in the registry section (the rounds counter calls it)
+local saveAll      -- defined in the registry section (the rounds counter calls it)
+local resetCups    -- defined in the registry section (a round change empties the cups)
 
 local function find(name)
   local c = root:findByName(name, true)
@@ -181,7 +200,7 @@ end
 -- ---------------------------------------------------------------------------
 --  newLoadCell — gaiwan, cups
 -- ---------------------------------------------------------------------------
-local POINT_KEY = { none = 'N', empty = 'E', tea = 'F' }
+local POINTS = { 'none', 'empty', 'tea' }
 
 local function newLoadCell(cfg)
   local self = newModule(cfg)
@@ -199,6 +218,9 @@ local function newLoadCell(cfg)
     tea   = find(p .. 'tea_val'),
   }
   self.hist = {}         -- recent readings {t, v} for capture
+  self.sip = cfg.sip or 0.33
+  self.seat = 1          -- how heavy the current spot reads (1 = like the capture)
+  self.tareBand = cfg.tare_band or TARE_BAND
 
   function self.receive(v, now)
     self.target = v
@@ -210,150 +232,219 @@ local function newLoadCell(cfg)
     end
   end
 
-  -- position of the tea point on the weight axis (0 = nothing on the scale,
-  -- 1 = empty vessel); nil unless all three points are captured and sensible
+  -- calibration: N = NO point (live), dE = empty step above N, dF = tea step above EMPTY
+  -- tea step in weight units (1 = the empty step); nil unless it points the same way
   function self.teaW()
-    local N, E, F = self.N, self.E, self.F
-    if not (N and E and F) or N == E then return nil end
-    local wF = (F - N) / (E - N)
-    if wF <= 1 then return nil end   -- tea must weigh more than the empty vessel
-    return wF
+    if not (self.dE and self.dF) or self.dE == 0 then return nil end
+    local t = self.dF / self.dE
+    if t <= 0 then return nil end
+    return t
   end
 
   -- weight in empty-vessel units: 0 = nothing on the scale, 1 = empty vessel
   function self.weight(v)
-    local N, E = self.N, self.E
-    if not (N and E) or N == E then return nil end
-    return (v - N) / (E - N)
+    if not (self.N and self.dE) or self.dE == 0 then return nil end
+    return (v - self.N) / self.dE
+  end
+
+  -- a calibration point as an absolute reading (what the buttons show)
+  function self.point(key)
+    if key == 'none' then return self.N end
+    local e = (self.N and self.dE) and (self.N + self.dE) or self.pE
+    if key == 'empty' then return e end
+    if e and self.dF then return e + self.dF end
+    return self.pF
   end
 
   -- lifted = anything but a settled vessel (lifted, being placed, empty scale).
   -- Written to the toggle only when it changes, so a hand tap stays until the
   -- next real lift / put-down.
+  -- The lift toggle shows the TARGET (lit = lifted) and carries no MIDI of its own;
+  -- the script sends the lift CC as a ramp (LIFT_RISE_S up, LIFT_FALL_S down, 0 = jump).
+  -- A change of the sensor state sets the target; a hand tap on the toggle sets it too
+  -- and ramps the same way, until the sensor state changes again.
   function self.setLifted(lifted)
     if self.lifted == lifted then return end
     self.lifted = lifted
-    local x = lifted and 1 or 0
-    if self.ui.lift and self.ui.lift.values.x ~= x then self.ui.lift.values.x = x end
+    self.liftGoal = lifted and 1 or 0
+    local ctl = self.ui.lift
+    if ctl and ctl.values.x ~= self.liftGoal then ctl.values.x = self.liftGoal end
+    self.liftX = self.liftGoal
+  end
+
+  self.liftGoal, self.liftX = 0, 0                  -- start: on the scale
+
+  function self.rampLift(dt)
+    local ctl = self.ui.lift
+    if not ctl then return end
+    if ctl.values.x ~= self.liftX then             -- a hand tap
+      self.liftX = ctl.values.x
+      self.liftGoal = (self.liftX > 0.5) and 1 or 0
+    end
+    local cur, goal = self.liftOut or 0, self.liftGoal
+    if cur == goal then return end
+    local secs = (goal > cur) and LIFT_RISE_S or LIFT_FALL_S
+    if secs <= 0 then cur = goal
+    elseif goal > cur then cur = math.min(goal, cur + dt / secs)
+    else cur = math.max(goal, cur - dt / secs) end
+    self.liftOut = cur
+    local v = math.floor(cur * 127 + 0.5)
+    if v ~= self.liftSent then
+      self.liftSent = v
+      sendMIDI({ 0xB0 + MIDI_CHANNEL - 1, cfg.lift_cc, v }, MIDI_CONN)
+    end
+  end
+
+  function self.setFill(f)
+    f = math.clamp(f, 0, 1)
+    if f < 0.02 then f = 0 elseif f > 0.98 then f = 1 end   -- three sips of 0.33 = 0
+    if self.fill ~= f then
+      self.fill = f
+      saveAll()
+    end
+  end
+
+  function self.setRounds(r) self.rounds = r end
+
+  -- tea was poured into the vessel
+  local function pour(now)
+    self.setFill(1)
+    self.pours = (self.pours or 0) + 1
+    if self.rounds then self.rounds.fullHit(now) end
+  end
+
+  -- the rise that counts as a pour (fix 1: smaller on a spot that reads light)
+  local function pourRise(tw) return POUR_FRACTION * tw * self.seat end
+
+  -- a vessel has settled on the scale again
+  local function arrive(w, now)
+    local ep = self.ep
+    self.ep = nil
+    local tw = self.teaW()
+    if ep and not ep.none then
+      -- never left the scale (hand on it, lid lifted, slid, held while pouring):
+      -- keep the old base, so a pour made meanwhile is still seen as a rise
+      if tw and ep.base and (w - ep.base) >= pourRise(tw) then pour(now); self.base = w end
+      self.stillW, self.stillT = nil, nil
+      return
+    end
+    if ep then                                     -- came back after being away
+      local away = (now - ep.t0) / 1000
+      if cfg.pour_on_return and tw and ep.base and (w - ep.base) >= pourRise(tw) then
+        pour(now)                                  -- came back heavier (refilled off the scale)
+      elseif away >= MIN_LIFT_S then
+        self.setFill((self.fill or 0) - self.sip)  -- a sip: the level only goes down
+        self.sips = (self.sips or 0) + 1
+      end
+    end
+    -- new spot: how heavy does it read? (expected weight here = 1 + fill × tea step)
+    local expect = 1 + (self.fill or 0) * (tw or 0)
+    self.seat = math.clamp(w / expect, POUR_SEAT_MIN, 1)
+    self.seatW = w / expect
+    self.base = w
+    self.stillW, self.stillT = nil, nil
   end
 
   -- the state machine (see header); w is the current weight
   function self.step(w, now)
     local band = math.max(self.ui.snap.values.x * SNAP_MAX, STABLE_BAND)
     local s = self.state
-    if not s then            -- first look (start, capture, clear, manual release)
+    if not s then            -- first look (start, capture, clear, tare, manual release)
       self.state = (w <= band) and 'none' or 'present'
-      self.ref = w
-      self.firstLook = true
+      self.ref, self.base = w, w
+      self.ep, self.stillW, self.stillT = nil, nil, nil
+      self.off = (self.state == 'none')
+      if self.fill == nil then                     -- nothing remembered: a guess from the weight
+        local tw = self.teaW()
+        self.fill = (self.state == 'present' and tw and (w - 1) >= 0.5 * tw) and 1 or 0
+        saveAll()
+      end
     elseif s == 'none' then
       if w > band then       -- something arrives
         self.state, self.why = 'transit', 'placing'
         self.anchorW, self.anchorT = w, now
       end
     elseif s == 'present' then
-      if w > self.ref then                         -- filling: follow upwards
-        -- fix 11: at most RISE_SLEW of the empty -> tea step per second, so a hand pressing on the vessel or
-        -- lifting its lid (a very fast rise) neither moves the fill nor counts as a
-        -- level to drop from (pouring is far slower)
-        if RISE_SLEW > 0 and self.dt then
-          local span = self.teaW()               -- empty -> tea, in weight units
-          span = span and (span - 1) or 1
-          self.ref = math.min(w, self.ref + RISE_SLEW * span * self.dt)
-        else
-          self.ref = w
-        end
-      end
+      if w > self.ref then self.ref = w end        -- filling: follow upwards
+      self.off = false
       if self.ref - w > LIFT_DROP then             -- got lighter = lifted
         self.state, self.why = 'transit', 'lifted'
         self.anchorW, self.anchorT = w, now
+        self.ep = { t0 = now, base = self.base, none = false }
       end
     else                     -- transit: wait until the weight has been still
       if math.abs(w - self.anchorW) > STABLE_BAND then
         self.anchorW, self.anchorT = w, now
       elseif now - self.anchorT >= SETTLE_MS then
-        self.state = (w <= band) and 'none' or 'present'
-        self.ref = w
+        local new = (w <= band) and 'none' or 'present'
+        self.state, self.ref = new, w
+        if new == 'none' then
+          if self.ep then self.ep.none = true end
+          self.off = true
+        else
+          arrive(w, now)
+        end
       end
     end
-    self.setLifted(self.state ~= 'present')
-    self.checkFull(w, now)
+    if w <= band then self.off = true end
+    if self.off and self.ep then self.ep.none = true end
+    -- lift CC (fix 1): only when the vessel really left the scale, not for a
+    -- slide, a hand or a lid; it goes back to 0 once it has settled again
+    self.setLifted(self.state ~= 'present' and self.off)
   end
 
-  -- fix 11: auto-tare. A scale that reads (nearly) nothing and stays still for
-  -- TARE_HOLD_S takes that reading as the new NO point, so slow drift and the
-  -- small rest after removing a vessel never need a manual NO capture. Only
-  -- within TARE_BAND of NO, so a lid alone (about 0.2) is never tared away.
+  -- a vessel that stands: has tea been poured in? Looks at the weight each time
+  -- it has been still for FULL_HOLD_S and compares it with the level before;
+  -- the level follows slow drift (rises under DRIFT_FRACTION of the tea step).
+  function self.watchPour(w, now)
+    if self.state ~= 'present' then
+      self.stillW, self.stillT = nil, nil
+      return
+    end
+    if not self.stillW or math.abs(w - self.stillW) > STABLE_BAND then
+      self.stillW, self.stillT = w, now
+    elseif now - self.stillT >= FULL_HOLD_S * 1000 then
+      local tw = self.teaW()
+      if not tw then
+        self.base = w          -- no tea step captured yet: nothing to detect, just follow
+      elseif self.base and (w - self.base) >= pourRise(tw) then
+        pour(now)
+        self.base = w
+      elseif not self.base or w < self.base or (w - self.base) < DRIFT_FRACTION * tw * self.seat then
+        self.base = w          -- lower, or a small rise: drift follows. A bigger rise stays
+      end                      -- on record so a pour in two goes (a pause between) still adds up
+      self.stillT = now
+    end
+  end
+
+  -- tare (fix 1): only while the scale is off (vessel away, state settled), within
+  -- the tare band and still for TARE_HOLD_S. NO takes the reading; EMPTY and TEA
+  -- are steps above it, so they move with it. The state machine is NOT restarted:
+  -- a lift in progress stays a lift (the sip / pour-out is still counted on return),
+  -- only the remembered weights are shifted by the same amount.
   function self.autoTare(w, now)
-    if TARE_HOLD_S <= 0 or math.abs(w) > TARE_BAND then self.tareT = nil; return false end
+    if TARE_HOLD_S <= 0 or self.state ~= 'none' or math.abs(w) > self.tareBand then
+      self.tareT = nil
+      return false
+    end
     if not self.tareT or math.abs(w - self.tareW) > STABLE_BAND then
       self.tareW, self.tareT = w, now
       return false
     end
     if now - self.tareT < TARE_HOLD_S * 1000 then return false end
-    self.tareT = now                       -- next adjustment after another hold
+    self.tareT = now
     if math.abs(w) < 0.002 then return false end
-    self.N = self.N + w * (self.E - self.N)
-    self.restart()                         -- classify the scale afresh
+    self.N = self.N + w * self.dE
+    for _, k in ipairs({ 'ref', 'base', 'anchorW', 'stillW', 'tareW' }) do
+      if self[k] then self[k] = self[k] - w end
+    end
+    if self.ep and self.ep.base then self.ep.base = self.ep.base - w end
+    self.tares = (self.tares or 0) + 1
     saveAll()
     return true
   end
 
-  -- weights at which the vessel counts as full / ready to be counted again
-  function self.fullLevels()
-    local wF = self.teaW()
-    if not wF then return nil end
-    return 1 + ROUND_FULL_AT * (wF - 1), 1 + ROUND_REARM_AT * (wF - 1)
-  end
-
-  function self.setRounds(r) self.rounds = r end
-
-  -- every time a resting vessel reaches the tea point: tell the round counter.
-  -- Edge-triggered with hysteresis; the first look at a vessel never counts
-  -- (power-up, capture, clear, releasing a held fader).
-  function self.checkFull(w, now)
-    local fullW, rearmW = self.fullLevels()
-    if not fullW then return end
-    local above = self.state == 'present' and w >= fullW
-    -- fix 11: "full" must also be held still for FULL_HOLD_S, so a hand pressing
-    -- on the vessel or lifting its lid (a short, moving peak) does not count
-    local held = false
-    if above then
-      if not self.fullSince or math.abs(w - self.fullW) > STABLE_BAND then
-        self.fullSince, self.fullW = now, w
-      end
-      held = now - self.fullSince >= FULL_HOLD_S * 1000
-    else
-      self.fullSince = nil
-    end
-    if self.firstLook then
-      self.firstLook = false
-      self.armed = not above
-    elseif self.state ~= 'present' then
-      self.armed = true                -- lifted / arriving: counts next time it is full
-    elseif held then
-      if self.armed then
-        self.armed = false
-        if self.rounds then self.rounds.fullHit(now) end
-      end
-    elseif w < rearmW then
-      self.armed = true
-    end
-  end
-
-  -- fill level 0..1 of a resting vessel: EMPTY -> EMPTY_V … WITH TEA -> FULL_V
-  -- (capped). Without the tea point there is no scale yet: EMPTY_V.
-  function self.map(v)
-    local w, wF = self.weight(v), self.teaW()
-    if not w then return nil end
-    if not wF then return EMPTY_V end
-    local tol = self.ui.snap.values.x * SNAP_MAX
-    if math.abs(w - 1) <= tol then return EMPTY_V end
-    if math.abs(w - wF) <= tol then return FULL_V end
-    return EMPTY_V + (FULL_V - EMPTY_V) * math.clamp((w - 1) / (wF - 1), 0, 1)
-  end
-
-  -- move the output toward the goal: down = linear (whole drop in FALL_S),
-  -- up = smoothed with RISE_TAU
+  -- the output goal: EMPTY_V … FULL_V by the stored fill; down glides, up smooths
   function self.glide(dt)
     local goal, out = self.goal, self.out
     if goal < out then
@@ -368,24 +459,46 @@ local function newLoadCell(cfg)
     end
   end
 
+  -- captures work in any order (fix 2). A value captured before the point it is
+  -- measured from waits (pE / pF, absolute) until that point exists.
+  local function settle()
+    if self.N and not self.dE and self.pE then self.dE = self.pE - self.N; self.pE = nil end
+    if self.N and self.dE and not self.dF and self.pF then
+      self.dF = self.pF - (self.N + self.dE); self.pF = nil
+    end
+  end
+
   function self.capture(point)
-    local key = POINT_KEY[point]
-    if not key or not self.target then return end
+    if not self.target then return end
     local now, sum, n = getMillis(), 0, 0
     for _, h in ipairs(self.hist) do
       if h.t >= now - CAPTURE_MS then sum = sum + h.v; n = n + 1 end
     end
-    self[key] = n > 0 and sum / n or self.target   -- quiet module: last value
+    local m = n > 0 and sum / n or self.target     -- quiet module: last value
+    if point == 'none' then
+      self.N = m                                   -- the steps stay: EMPTY and TEA move with it
+    elseif point == 'empty' then
+      local tea = self.point('tea') or self.pF     -- keep WITH TEA where it was
+      if self.N then self.dE = m - self.N; self.pE = nil else self.dE, self.pE = nil, m end
+      self.dF, self.pF = nil, tea
+    elseif point == 'tea' then
+      if self.N and self.dE then self.dF = m - (self.N + self.dE); self.pF = nil
+      else self.dF, self.pF = nil, m end
+    else
+      return
+    end
+    settle()
     self.restart()
   end
 
   function self.clear()
-    self.N, self.E, self.F = nil, nil, nil
+    self.N, self.dE, self.dF, self.fill = nil, nil, nil, nil
+    self.pE, self.pF = nil, nil
     self.restart()
   end
 
   -- fresh look: the next reading classifies the scale again and the output
-  -- jumps straight to it (no glide)
+  -- jumps straight to the stored fill (no glide)
   function self.restart()
     self.state, self.goal, self.fallRate, self.jump = nil, nil, nil, true
   end
@@ -393,19 +506,40 @@ local function newLoadCell(cfg)
 
   function self.serialize()
     local function f(v) return v and string.format('%.1f', v) or '' end
-    return f(self.N) .. ',' .. f(self.E) .. ',' .. f(self.F)
+    return 'v5:' .. f(self.N) .. ',' .. f(self.dE) .. ',' .. f(self.dF) .. ',' ..
+           (self.fill and string.format('%.3f', self.fill) or '')
   end
 
   function self.restore(s)
-    local keys, k = { 'N', 'E', 'F' }, 0
+    local v5 = string.sub(s, 1, 3) == 'v5:'
+    if v5 then s = string.sub(s, 4) end
+    local vals, k = {}, 0
     for field in string.gmatch(s .. ',', '([^,]*),') do
       k = k + 1
-      if k > 3 then break end
-      self[keys[k]] = tonumber(field)
+      if k > 4 then break end
+      vals[k] = tonumber(field)
+    end
+    if v5 then
+      self.N, self.dE, self.dF = vals[1], vals[2], vals[3]
+      if vals[4] then self.fill = math.clamp(vals[4], 0, 1) end
+    else                                           -- v3 / v4 tag: absolute N, E, F
+      self.N = vals[1]
+      self.dE = (vals[1] and vals[2]) and (vals[2] - vals[1]) or nil
+      self.dF = (vals[2] and vals[3]) and (vals[3] - vals[2]) or nil
+    end
+  end
+
+  function self.setFillGoal()
+    if not self.fill then return end
+    local goal = EMPTY_V + (FULL_V - EMPTY_V) * self.fill
+    if not self.goal or math.abs(goal - self.goal) > 0.0005 then
+      if self.goal and goal < self.goal then self.fallRate = nil end   -- restart the linear fall
+      self.goal = goal
     end
   end
 
   function self.tick(now, dt)
+    self.rampLift(dt)               -- also with no sensor / no calibration: a hand tap ramps
     local held = self.isHeld()
     if held then
       self.manual = true
@@ -425,26 +559,9 @@ local function newLoadCell(cfg)
     local w = self.weight(self.target)
     if not w then self.state = nil; return end
     if self.autoTare(w, now) then w = self.weight(self.target) end
-    self.dt = dt
     self.step(w, now)
-
-    if self.state == 'present' then
-      local v = self.raw
-      -- a little lighter than the settled weight (evaporation, jitter, or the very
-      -- start of a lift): hold the settled level instead of sagging with it
-      if w < self.ref then v = self.N + self.ref * (self.E - self.N) end
-      -- fix 11: while the weight is above the settled level (ref, which rises at most
-      -- RISE_SLEW of the empty -> tea step per second, see step) the fill follows ref, not the raw weight
-      if RISE_SLEW > 0 and w > self.ref then v = self.N + self.ref * (self.E - self.N) end
-      local goal = self.map(v)
-      if goal then
-        if self.goal and goal < self.goal - 0.0005 then
-          self.fallRate = nil            -- a new, lower goal: restart the linear fall
-        end
-        if not self.goal or math.abs(goal - self.goal) > 0.0005 then self.goal = goal end
-      end
-    end
-    -- not present (lifted / placing / empty scale): the goal stays = output holds
+    self.watchPour(w, now)
+    self.setFillGoal()
 
     if not self.goal then return end
     if self.jump or not self.out then
@@ -467,37 +584,40 @@ local function newLoadCell(cfg)
       local age = now - self.last
       local st = age < LIVE_MS and 'live' or string.format('steady %ds', math.floor(age / 1000))
       if self.state == 'transit' then st = self.why end
+      if self.seatW and self.state == 'present' then st = st .. string.format('  seat %.2f', self.seatW) end
       setText(u.status, string.format('raw %.0f   %s', self.raw, st))
     end
 
     if self.isHeld() or not self.target then
       setText(u.outval, self.midiText(true))
-    elseif not (self.N and self.E) then
-      setText(u.outval, 'capture NO + EMPTY')
-    elseif self.N == self.E then
+    elseif not self.N then
+      setText(u.outval, 'capture NO')
+    elseif not self.dE then
+      setText(u.outval, 'capture EMPTY')
+    elseif self.dE == 0 then
       setText(u.outval, 'NO = EMPTY ?')
-    elseif self.F and not self.teaW() then
+    elseif self.dF and not self.teaW() then
       setText(u.outval, 'TEA ≤ EMPTY ? recapture')
-    elseif not self.F then
+    elseif not self.dF then
       setText(u.outval, self.midiText(false) .. '   need TEA')
     else
-      local s = self.midiText(false)
+      local s = string.format('%s   fill %d%%', self.midiText(false), math.floor((self.fill or 0) * 100 + 0.5))
       if self.state ~= 'present' then s = s .. '   held'
       elseif self.goal and self.out and self.out > self.goal + 0.002 then s = s .. '   falling' end
       setText(u.outval, s)
     end
 
-    local on = u.lift and u.lift.values.x > 0.5
+    local on = self.lifted
     setText(u.liftLbl, string.format('%s   CC %d = %d', on and 'LIFTED' or 'on the scale',
                                      cfg.lift_cc, on and 127 or 0))
 
     local pct = u.snap.values.x * SNAP_MAX
     setText(u.snapVal, string.format('±%.1f%%', pct * 100))
-    setText(u.snapCnt, (self.N and self.E) and string.format('≈%.0f', math.abs(self.E - self.N) * pct) or '')
+    setText(u.snapCnt, self.dE and string.format('≈%.0f', math.abs(self.dE) * pct) or '')
     local tau = u.smooth.values.x * SMOOTH_MAX
     setText(u.smoothVal, tau <= 0.001 and 'off' or string.format('%.2f s', tau))
 
-    for point, key in pairs(POINT_KEY) do setText(u.pts[point], num(self[key])) end
+    for _, point in ipairs(POINTS) do setText(u.pts[point], num(self.point(point))) end
     self.refreshBattery(now)
   end
 
@@ -641,14 +761,12 @@ local function newRounds(cfg)
   local p = cfg.id .. '_'
   self.ui.count = find(p .. 'count')
   self.count = 0
-  self.noteOffs = {}     -- note -> time to send its note-off
 
   -- short note for the current count (ROUND_NOTE + count; count 0 = reset note)
   local function fireNote()
     local n = cfg.note + self.count
     if n > 127 then return end
     sendMIDI({ 0x90 + MIDI_CHANNEL - 1, n, 127 }, MIDI_CONN)
-    self.noteOffs[n] = getMillis() + ROUND_NOTE_MS
     self.lastNote = n
   end
 
@@ -658,10 +776,10 @@ local function newRounds(cfg)
     self.count = math.max(0, math.min(127, n))     -- it goes out as a MIDI CC value
     self.out = nil
     saveAll()
-    if force or self.count ~= before then fireNote() end
+    if force or self.count ~= before then fireNote(); resetCups() end
   end
 
-  -- called by the gaiwan every time it settles at the tea point
+  -- called by the gaiwan every time tea is poured into it
   function self.fullHit(now)
     if self.lastAt and now - self.lastAt < ROUND_MIN_GAP_S * 1000 then return end
     self.lastAt = now
@@ -698,12 +816,6 @@ local function newRounds(cfg)
       self.out = nil                       -- released: back to the real count
     end
     if self.zeroAt and now - self.zeroAt > RESET_CONFIRM_S * 1000 then self.zeroAt = nil end
-    for n, at in pairs(self.noteOffs) do
-      if now >= at then
-        sendMIDI({ 0x80 + MIDI_CHANNEL - 1, n, 0 }, MIDI_CONN)
-        self.noteOffs[n] = nil
-      end
-    end
     if held then return end
     local x = self.count / 127
     if self.out ~= x then
@@ -718,7 +830,7 @@ local function newRounds(cfg)
     if self.zeroAt then
       setText(u.status, 'press reset again to confirm')
     else
-      local s = string.format('%s full → +1', cfg.source or 'vessel')
+      local s = string.format('%s filled → +1', cfg.source or 'vessel')
       if self.lastAt then
         s = s .. string.format('   (last %ds ago)', math.floor((now - self.lastAt) / 1000))
       end
@@ -746,6 +858,12 @@ function saveAll()
     if s then parts[#parts + 1] = m.id .. '=' .. s end
   end
   root.tag = table.concat(parts, ';')
+end
+
+function resetCups()
+  for _, m in ipairs(modules) do
+    if m.cfg.reset_on_round and m.setFill then m.setFill(0) end
+  end
 end
 
 local function restoreAll()

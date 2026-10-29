@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-okuma interactive — TouchOSC layout generator (v4)
+okuma interactive — TouchOSC layout generator (v5)
 ==================================================
 
 Builds  okuma_bridge.tosc  (the TouchOSC layout) and
@@ -12,6 +12,8 @@ from the CONFIG section below and the Lua template next to this file.
 
 Only the Python standard library is used.
 
+v5 = v4 + fill by EVENTS (pour / sip) instead of by weight, steps stored as offsets,
+tare whenever the scale is empty and still, wobble-proof events (v5 fix 1).
 v4 = v3 structure + from Greg's v12: fill CC 0 (empty) … 127 (full) that holds
 while lifted and glides, lift CCs + lift toggles, round notes.
 
@@ -66,26 +68,37 @@ MIDI_CONNECTION = 1                              # TouchOSC connection used for 
 #   cc       MIDI CC number the output fader sends
 #            fixed accessories first (gaiwan 20, rounds 21, pitcher 22), cups last
 #            (23+) so new cups simply continue the numbering
+#   sip      load cells: the fill falls by this fraction (0..1) each time the vessel is lifted off
+#            the scale for MIN_LIFT_S and put back. Cups 0.33 = three sips; gaiwan 1.0 = empty
+#   pour_on_return  gaiwan: coming back heavier than it left (refilled off the scale) = a pour
+#   reset_on_round  cups: every round change (gaiwan pour or the round buttons) sets the fill to 0
+#   tare_band       optional: own TARE_BAND for this cell (gaiwan 0.10: a lid alone is never tared)
 #   lift_cc  load cells: MIDI CC of the lift toggle (127 = lifted, 0 = on the scale)
 #            CC 1–5 as in Greg's v12 (cup1–4 = 1–4, gaiwan = 5)
-#   note     'rounds' only: note of the reset; round n sends note + n
+#   note     'rounds' only: note of the reset; round n sends note + n (note-on, velocity 127,
+#            channel MIDI_CHANNEL; no note-off and no CC are sent)
 #   color    hex colour of the group
 SENSORS = [
     dict(kind='loadcell', id='gaiwan',  title='GAIWAN',  noun='GAIWAN',
-         osc='/okuma/gaiwan',    battery='/okuma/gaiwan/battery', cc=20, lift_cc=5, color='#d39b4a'),
+         osc='/okuma/gaiwan',    battery='/okuma/gaiwan/battery', cc=20, lift_cc=5, color='#d39b4a',
+         sip=1.0, pour_on_return=True, tare_band=0.10),
     dict(kind='rounds',   id='rounds',  title='ROUNDS',  source='gaiwan',
-         cc=21, note=60, color='#e6c84d'),
+         cc=21, note=0, color='#e6c84d'),
     dict(kind='tilt',     id='pitcher', title='PITCHER',
          osc_tilt='/okuma/imu1/tilt', osc_dir='/okuma/imu1/dir',
          battery='/okuma/imu1/battery',                          cc=22, color='#9a80f2'),
     dict(kind='loadcell', id='cup1',    title='CUP 1',   noun='CUP',
-         osc='/okuma/cup1',      battery='/okuma/cup1/battery',   cc=23, lift_cc=1, color='#33bfb3'),
+         osc='/okuma/cup1',      battery='/okuma/cup1/battery',   cc=23, lift_cc=1, color='#33bfb3',
+         sip=0.33, reset_on_round=True),
     dict(kind='loadcell', id='cup2',    title='CUP 2',   noun='CUP',
-         osc='/okuma/cup2',      battery='/okuma/cup2/battery',   cc=24, lift_cc=2, color='#8ccc4d'),
+         osc='/okuma/cup2',      battery='/okuma/cup2/battery',   cc=24, lift_cc=2, color='#8ccc4d',
+         sip=0.33, reset_on_round=True),
     dict(kind='loadcell', id='cup3',    title='CUP 3',   noun='CUP',
-         osc='/okuma/cup3',      battery='/okuma/cup3/battery',   cc=25, lift_cc=3, color='#e66673'),
+         osc='/okuma/cup3',      battery='/okuma/cup3/battery',   cc=25, lift_cc=3, color='#e66673',
+         sip=0.33, reset_on_round=True),
     dict(kind='loadcell', id='cup4',    title='CUP 4',   noun='CUP',
-         osc='/okuma/cup4',      battery='/okuma/cup4/battery',   cc=26, lift_cc=4, color='#4d9ae6'),
+         osc='/okuma/cup4',      battery='/okuma/cup4/battery',   cc=26, lift_cc=4, color='#4d9ae6',
+         sip=0.33, reset_on_round=True),
 ]
 
 # Load cell fill level (the output fader's CC). The three captured points (NO,
@@ -93,8 +106,11 @@ SENSORS = [
 # vessel) to FULL_MIDI (vessel with tea, also the cap). Keep them different.
 EMPTY_MIDI     = 0
 FULL_MIDI      = 127
-SNAP_MAX       = 0.25    # snap fader full scale = ±25 % of the empty-vessel weight
-SNAP_DEFAULT   = 0.05    # start at ±5 %
+# snap fader = the "off the scale" band (v5 fix 1): below it the vessel counts as away.
+# Half an empty vessel by default: an empty vessel on a light-reading spot still stays above it,
+# and drift up to that much does not fake a vessel
+SNAP_MAX       = 1.0     # snap fader full scale = ±100 % of the empty-vessel weight
+SNAP_DEFAULT   = 0.5     # start at ±50 %
 SMOOTH_MAX     = 1.0     # smooth fader full scale = 1 s time constant
 SMOOTH_DEFAULT = 0.0     # start with no extra smoothing
 
@@ -105,11 +121,11 @@ SMOOTH_DEFAULT = 0.0     # start with no extra smoothing
 #              in seconds (0 = jump)
 FALL_S   = 5.0
 RISE_TAU = 0.6
-# RISE_SLEW (fix 11): the fill level of a resting vessel may rise at most this fraction of
-# the empty -> tea step per second (0.25 = a full pour takes at least 4 s; 0 = off, the default since a lid or a pour of water is as fast as a hand and the fader lagged behind the round counter). A hand pressing on
-# the vessel or lifting the lid is a faster, shorter bump (it would otherwise jump the fill to
-# full); a real pour is slower. Falls are not limited (FALL_S does that). 0 = off
-RISE_SLEW = 0
+# The LIFT CC (127 = lifted, 0 = on the scale) is not a switch but a ramp (fix 5):
+#   LIFT_RISE_S  0 -> 127 takes this many seconds when a vessel is lifted (0 = jump)
+#   LIFT_FALL_S  127 -> 0 takes this many seconds after it is back and settled (0 = jump)
+LIFT_RISE_S = 3.0
+LIFT_FALL_S = 3.0
 
 # Lift / put down state machine. Weights are in empty-vessel units:
 # 0 = nothing on the scale, 1 = empty vessel.
@@ -123,33 +139,43 @@ LIFT_DROP   = 0.08
 STABLE_BAND = 0.03
 SETTLE_MS   = 400
 
-# Auto-tare (fix 11, all load cells): a scale that reads within TARE_BAND of the NO point
-# (empty-vessel units, so 0.10 = 10 % of the empty vessel) and stays still for TARE_HOLD_S
-# seconds takes that reading as the new NO point. Removes slow drift and the small rest
-# left after removing a vessel without pressing NO. Keep TARE_BAND below the weight of a
-# lid alone. 0 seconds = off
-TARE_BAND   = 0.10
+# Auto-tare (v5 fix 1, all load cells): whenever the vessel is away (below the snap band),
+# the scale reads within TARE_BAND of NO (empty-vessel units) and stays still for TARE_HOLD_S
+# seconds, that reading becomes the new NO; EMPTY and WITH TEA move with it. This happens at
+# every round start and during long sips, and does not disturb the lift in progress.
+# Keep TARE_BAND below the snap band. A cell's tare_band overrides it (gaiwan: below a lid).
+# 0 seconds = off
+TARE_BAND   = 0.4
 TARE_HOLD_S = 5
 
-# Round counter (+1 every time the gaiwan is full). Weights as above.
-#   ROUND_FULL_AT     "full" = this fraction of the way from the empty weight to the
-#                     tea weight (0.95 = nearly at the captured tea point)
-#   ROUND_REARM_AT    it can count again once the weight has dropped below this
-#                     fraction (or the vessel was lifted / the scale was empty).
-#                     Keep it below ROUND_FULL_AT so a settling or evaporating
-#                     gaiwan can't count twice
+# Fill by events (v5). The weight of a load cell depends on where the vessel stands, so the
+# level is not read from it; it changes on events:
+#   POUR_FRACTION  a still rise of at least this fraction of the tea step (EMPTY -> WITH TEA)
+#                  = tea was poured -> fill 100 %. Lower = more sensitive (a missed pour is
+#                  worse than a false one). To be tuned on the real cups
+#   MIN_LIFT_S     off the scale at least this long and back = a sip / a refill check; shorter
+#                  lifts change nothing
+POUR_FRACTION = 0.5
+#   DRIFT_FRACTION a still rise smaller than this fraction of the tea step is taken as drift
+#                  (the reference follows it); a bigger one below POUR_FRACTION stays on record,
+#                  so a pour in two goes adds up
+#   POUR_SEAT_MIN  wobble (v5 fix 1): when a vessel settles on a spot that reads lighter than the
+#                  capture, the pour threshold shrinks with it, down to this factor (never grows)
+DRIFT_FRACTION = 0.15
+POUR_SEAT_MIN  = 0.5
+MIN_LIFT_S    = 2
+
+# Round counter (+1 every time tea is poured into the gaiwan, see POUR_FRACTION).
 #   ROUND_MIN_GAP_S   ignore a "full" less than this many seconds after the last
 #                     count (0 = off: every time it is full counts)
 #   RESET_CONFIRM_S   the reset button must be pressed twice within this time
 # Every change of the count also sends a short note: note + count (the rounds
 # line in SENSORS), so count 0 = reset note. No cap; notes stop above 127.
-ROUND_FULL_AT   = 0.95
-ROUND_REARM_AT  = 0.75
 ROUND_MIN_GAP_S = 3
 RESET_CONFIRM_S = 3
-# FULL_HOLD_S (fix 11): the weight must stay at or above the full level, still (within
-# STABLE_BAND), for this long before it counts. A hand pressing on the vessel or lifting
-# the lid is a short, moving peak and does not count. 0 = off
+# FULL_HOLD_S: a rise must stay still (within STABLE_BAND) this long before it counts as a
+# pour. A hand pressing on the vessel or lifting the lid is a short, moving peak and does not
+# count
 FULL_HOLD_S     = 1.5
 
 # Pitcher. total tilt = angle between the pitcher's current direction and its ZERO direction,
@@ -168,10 +194,11 @@ from the ZERO pose (module tilt + dir).
 Below {thr}° -> 0, zero..range -> 0..127.
 ZERO: press with the pitcher resting.
 
-Load cells: with the vessel settled,
-press NO, EMPTY, WITH TEA.
-Fill {e} empty … {f} full; holds while
-lifted, falls over {fall:g} s. Toggle = lift CC.
+Load cells: vessel in the MIDDLE,
+settled; press NO, EMPTY, WITH TEA.
+Fill {e}…{f}: a pour sets full, each
+sip lowers it; holds while lifted,
+falls over {fall:g} s. Toggle = lift CC.
 Drag a fader = manual MIDI.
 Battery: 0–100 on <module>/battery"""
 
@@ -318,14 +345,14 @@ def button(name, frame, color, notify_key, background=True):
     return node('BUTTON', props, value('x', 0) + TOUCH_VALUE)
 
 
-def toggle(name, frame, color, cc):
+def toggle(name, frame, color, cc=None):
     """Toggle button (on press) that carries its own MIDI CC: on = 127, off = 0.
     No background, so the text underneath stays readable; lit (filled) when on."""
     props = base_props(name, frame, color, background=False) + ''.join([
         prop('i', 'buttonType', 2), prop('b', 'press', True), prop('b', 'release', True),
         prop('b', 'valuePosition', False),
     ])
-    return node('BUTTON', props, value('x', 0) + TOUCH_VALUE, midi_cc_message(cc))
+    return node('BUTTON', props, value('x', 0) + TOUCH_VALUE, midi_cc_message(cc) if cc is not None else '')
 
 
 def labelled_button(name, frame, color, notify_key, texts):
@@ -362,7 +389,7 @@ def header(s, x, with_clear):
 def output(s, x):
     """The big MIDI fader and its value line."""
     sid = s['id']
-    return [fader(f'{sid}_out', (x + 5, 138, 100, 320), s['color'], 0, cc=s['cc']),
+    return [fader(f'{sid}_out', (x + 5, 138, 100, 320), s['color'], 0, cc=None if s['kind'] == 'rounds' else s['cc']),
             label(f'{sid}_outval', (x, 464, COL_W, 28), 'MIDI —', 14, WHITE, align=0)]
 
 
@@ -374,7 +401,7 @@ def loadcell_column(s, x):
         label(f'{sid}_smooth_lbl', (smooth_x - 3, 110, 50, 24), 'smooth', 12, DIM_TEXT),
         fader(f'{sid}_snap',   (snap_x, 138, 44, 270), PARAM, SNAP_DEFAULT / SNAP_MAX),
         fader(f'{sid}_smooth', (smooth_x, 138, 44, 270), PARAM, SMOOTH_DEFAULT / SMOOTH_MAX),
-        label(f'{sid}_snap_val',   (snap_x - 8, 412, 60, 20), '±5.0%', 11, DIM_TEXT),
+        label(f'{sid}_snap_val',   (snap_x - 8, 412, 60, 20), f'±{SNAP_DEFAULT*100:.1f}%', 11, DIM_TEXT),
         label(f'{sid}_snap_cnt',   (snap_x - 8, 432, 60, 20), '', 11, DIM_TEXT),
         label(f'{sid}_smooth_val', (smooth_x - 8, 412, 60, 20), 'off', 11, DIM_TEXT),
     ]
@@ -391,7 +418,7 @@ def loadcell_column(s, x):
     items += [label(f'{sid}_lift_box', frame, '', 12, WHITE, background='#26262c'),
               label(f'{sid}_lift_lbl', (x + 8, 730, COL_W - 16, 54),
                     f"on the scale   CC {s['lift_cc']} = 0", 13, WHITE),
-              toggle(f'{sid}_lift', frame, rgba(s['color'], 0.55), s['lift_cc'])]
+              toggle(f'{sid}_lift', frame, rgba(s['color'], 0.55))]
     return items
 
 
@@ -426,7 +453,7 @@ def rounds_column(s, x):
     sid = s['id']
     bx, bw = x + 112, COL_W - 112
     items = [
-        label(f'{sid}_title', (x, 15, COL_W, 36), f"{s['title']}   CC {s['cc']}", 18, s['color'], align=0),
+        label(f'{sid}_title', (x, 15, COL_W, 36), f"{s['title']}   note {s['note']}+", 18, s['color'], align=0),
         label(f'{sid}_status', (x, 78, COL_W, 22), '—', 12, DIM_TEXT, align=0),
     ] + output(s, x) + [
         label(f'{sid}_count_lbl', (bx, 110, bw, 20), 'round', 12, DIM_TEXT),
@@ -437,19 +464,19 @@ def rounds_column(s, x):
         items += labelled_button(f'rnd_{sid}_{op}', (bx, 244 + k * 72, bw, 62), color, 'round',
                                  [(f'{sid}_{op}_lbl', (0, 16, 30), text, 18 if op != 'zero' else 15, '#f2f2f2')])
     items.append(text_box(f'{sid}_note', (x, 500, COL_W, 280),
-                          f"""+1 each time the {s['source']} is full
-(at the captured tea point),
-also after a refill off the scale.
-Starts at 0.
+                          f"""+1 each time tea is poured
+into the {s['source']} (also a refill
+that comes back heavier after
+a lift). Starts at 0.
 
-MIDI CC {s['cc']} = the round number.
-Note {s['note']} + round on every change
-(note {s['note']} = reset, {s['note'] + 1} = round 1 …)
-— for Session scene launch.
+Every change sends a MIDI note
+on channel {MIDI_CHANNEL}: note-on, velocity 127,
+no note-off, no CC.
+Note {s['note']} = reset, {s['note'] + 1} = round 1 …
 
 +1 / −1 correct it (and send the note).
 reset: press twice (within {RESET_CONFIRM_S} s).
-Drag the fader = manual CC."""))
+The fader only shows the count."""))
     return items
 
 
@@ -478,6 +505,14 @@ def render_lua(template):
             fields.append(f"battery = {lua_string(s['battery'])}")
         if s.get('lift_cc') is not None:
             fields.append(f"lift_cc = {s['lift_cc']}")
+        if s.get('sip') is not None:
+            fields.append(f"sip = {s['sip']}")
+        if s.get('pour_on_return'):
+            fields.append('pour_on_return = true')
+        if s.get('reset_on_round'):
+            fields.append('reset_on_round = true')
+        if s.get('tare_band') is not None:
+            fields.append(f"tare_band = {s['tare_band']}")
         if s.get('note') is not None:
             fields.append(f"note = {s['note']}")
         rows.append('  { ' + ', '.join(fields) + ' },')
@@ -494,15 +529,18 @@ def render_lua(template):
         f'local SMOOTH_MAX = {SMOOTH_MAX}',
         f'local FALL_S = {FALL_S}',
         f'local RISE_TAU = {RISE_TAU}',
-        f'local RISE_SLEW = {RISE_SLEW}',
+        f'local LIFT_RISE_S = {LIFT_RISE_S}',
+        f'local LIFT_FALL_S = {LIFT_FALL_S}',
         f'local LIFT_DROP = {LIFT_DROP}',
         f'local STABLE_BAND = {STABLE_BAND}',
         f'local SETTLE_MS = {SETTLE_MS}',
         f'local TARE_BAND = {TARE_BAND}',
         f'local TARE_HOLD_S = {TARE_HOLD_S}',
         f'local FULL_HOLD_S = {FULL_HOLD_S}',
-        f'local ROUND_FULL_AT = {ROUND_FULL_AT}',
-        f'local ROUND_REARM_AT = {ROUND_REARM_AT}',
+        f'local POUR_FRACTION = {POUR_FRACTION}',
+        f'local MIN_LIFT_S = {MIN_LIFT_S}',
+        f'local DRIFT_FRACTION = {DRIFT_FRACTION}',
+        f'local POUR_SEAT_MIN = {POUR_SEAT_MIN}',
         f'local ROUND_MIN_GAP_S = {ROUND_MIN_GAP_S}',
         f'local RESET_CONFIRM_S = {RESET_CONFIRM_S}',
         f'local POUR_THRESHOLD = {POUR_THRESHOLD}',
@@ -544,15 +582,16 @@ def check_config():
     for name, v in (('EMPTY_MIDI', EMPTY_MIDI), ('FULL_MIDI', FULL_MIDI)):
         assert isinstance(v, int) and 0 <= v <= 127, f'{name} must be a whole number 0–127, got {v}'
     assert EMPTY_MIDI != FULL_MIDI, 'EMPTY_MIDI and FULL_MIDI must be different'
-    assert FALL_S >= 0 and RISE_TAU >= 0 and RISE_SLEW >= 0, 'FALL_S, RISE_TAU and RISE_SLEW must be 0 or more'
+    assert min(FALL_S, RISE_TAU, LIFT_RISE_S, LIFT_FALL_S) >= 0, 'FALL_S, RISE_TAU, LIFT_RISE_S and LIFT_FALL_S must be 0 or more'
     assert 1 <= MIDI_CHANNEL <= 16 and 1 <= MIDI_CONNECTION <= 10, 'MIDI channel 1–16, connection 1–10'
     assert 0 <= POUR_THRESHOLD < RANGE_DEFAULT and RANGE_MIN <= RANGE_DEFAULT <= RANGE_MAX, \
         'need 0 <= POUR_THRESHOLD < RANGE_DEFAULT and RANGE_MIN <= RANGE_DEFAULT <= RANGE_MAX'
     assert (RANGE_MAX - RANGE_MIN) % RANGE_STEP == 0 and (RANGE_DEFAULT - RANGE_MIN) % RANGE_STEP == 0, \
         'RANGE_MAX and RANGE_DEFAULT must be on the RANGE_STEP grid'
-    assert 0 <= TARE_BAND < 0.2 and TARE_HOLD_S >= 0 and FULL_HOLD_S >= 0, \
-        'need 0 <= TARE_BAND < 0.2 (below a lid), TARE_HOLD_S >= 0, FULL_HOLD_S >= 0'
-    assert 0 < ROUND_REARM_AT < ROUND_FULL_AT <= 1, 'need 0 < ROUND_REARM_AT < ROUND_FULL_AT <= 1'
+    assert 0 <= TARE_BAND <= SNAP_DEFAULT and TARE_HOLD_S >= 0 and FULL_HOLD_S >= 0, \
+        'need 0 <= TARE_BAND <= SNAP_DEFAULT, TARE_HOLD_S >= 0, FULL_HOLD_S >= 0'
+    assert 0 < DRIFT_FRACTION < POUR_FRACTION <= 1 and MIN_LIFT_S >= 0 and 0 < POUR_SEAT_MIN <= 1, \
+        'need 0 < DRIFT_FRACTION < POUR_FRACTION <= 1, MIN_LIFT_S >= 0, 0 < POUR_SEAT_MIN <= 1'
     for s in SENSORS:
         assert s['kind'] in COLUMN_BUILDERS, f"unknown kind {s['kind']}"
         if s['kind'] == 'rounds':
@@ -565,6 +604,7 @@ def check_config():
             assert s.get('osc_tilt') and s.get('osc_dir'), f"sensor {s['id']} needs osc_tilt and osc_dir"
         else:
             assert s.get('osc'), f"sensor {s['id']} needs an osc address"
+            assert 0 < s.get('sip', 0.33) <= 1, f"load cell {s['id']}: sip must be in (0, 1]"
             assert isinstance(s.get('lift_cc'), int) and 0 <= s['lift_cc'] <= 127, \
                 f"load cell {s['id']} needs a lift_cc 0–127"
         assert s['id'].isalnum(), f"id must be letters/digits: {s['id']}"
