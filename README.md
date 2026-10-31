@@ -2,10 +2,25 @@
 
 Sensor-to-MIDI bridge for *Seventh Bowl*, a tea-ceremony performance. ESP32 modules (HX711 load cells under the gaiwan and four cups, an IMU in the pitcher) send **OSC** to **TouchOSC**; a Lua script in the layout turns the readings into **MIDI** for Ableton Live and TouchDesigner.
 
-The module firmware is not part of this repository.
+The module firmware is not part of this repository. `osc_logger.py` records each ceremony (see *Recording a ceremony*).
 
-```
-ESP32 modules --OSC/UDP--> TouchOSC (this layout) --MIDI ch.1--> Ableton / TouchDesigner
+```mermaid
+flowchart LR
+  esp["ESP32 modules"] -- "OSC broadcast :10000" --> log["osc_logger.py"]
+  esp -- "OSC broadcast :10000" --> tosc2["TouchOSC (this layout)<br/>second laptop"]
+  log -- ":10001" --> tosc1["TouchOSC (this layout)"]
+  log -.-> file[("ceremonies/…/ceremony.jsonl")]
+  tosc1 -- "MIDI ch.1" --> abl["Ableton"]
+  tosc2 -- "MIDI ch.1" --> td["TouchDesigner"]
+  subgraph A ["Laptop A"]
+    log
+    tosc1
+    abl
+  end
+  subgraph B ["Laptop B"]
+    tosc2
+    td
+  end
 ```
 
 ## What it reports
@@ -32,7 +47,7 @@ Rounds: one note-on per change, velocity 127, note = `note` (0) + max(count, 0).
 
 ## OSC inputs
 
-`/okuma/gaiwan`, `/okuma/cup1` … `/okuma/cup4` (raw HX711 counts), `/okuma/imu1/tilt` and `/okuma/imu1/dir` (pitcher), each with `…/battery`. Receive port is set in TouchOSC (10000 in the tests).
+`/okuma/gaiwan`, `/okuma/cup1` … `/okuma/cup4` (raw HX711 counts), `/okuma/imu1/tilt` and `/okuma/imu1/dir` (pitcher), each with `…/battery`. Receive port is set in TouchOSC: **10001** on the laptop that runs the logger (the logger takes 10000), **10000** on the other.
 
 ## Build
 
@@ -50,6 +65,17 @@ Open `okuma_bridge.tosc` in TouchOSC. The committed `okuma_bridge.tosc` is the b
 1. Per vessel, with the scale empty press **NO**, then with the empty vessel standing press **EMPTY** (any order). The pour size per vessel is a setting in the config (in counts).
 2. Press **ZERO** on the pitcher in its resting pose.
 3. The big fader of each vessel is the input: OSC moves it, and a hand-drag feeds the logic the same way, so a whole ceremony can be played from the screen without sensors. Bottom = away, middle line = the empty vessel as it stands this round, top = one pour.
+
+## Recording a ceremony
+
+On the logger laptop:
+
+```
+pip install python-osc                         # once
+python osc_logger.py "closed test, Dong Ding"  # the note is optional; without it, it asks
+```
+
+It prints the ports and the log path, then records every OSC message to `../ceremonies/<date>_<time> <note>/ceremony.jsonl` (the `ceremonies` folder sits next to this repo, outside git) and passes each one on to TouchOSC. Press **Enter** to mark a moment (type a word first to label it), **Ctrl+C** to stop. The log's first line holds the start time and the note; the format is described at the top of `osc_logger.py`. Drop the log into studio.seventhbowl.com/ceremony/ to draw the night.
 
 ## Status
 
