@@ -227,8 +227,11 @@ local function newVessel(cfg)
   local self = newModule(cfg)
   local p = cfg.id .. '_'
   self.ui.state   = find(p .. 'state')
+  self.ui.pourF   = find(p .. 'pour_f')
+  self.ui.pourV   = find(p .. 'pour_val')
+  self.pour = cfg.pour                 -- counts one pour adds; set by the POUR fader, saved in the tag
   self.ui.last = find(p .. 'last')
-  self.ui.pts = { none = find(p .. 'none_val'), empty = find(p .. 'empty_val') }
+  self.ui.pts = { none = find(p .. 'none_val'), empty = find(p .. 'empty_val'), full = find(p .. 'full_val') }
   if cfg.channel then                  -- the gaiwan has no channel: it sends nothing
     self.full = newRamp(p .. 'full', p .. 'full_val', cfg.channel, CC_FULL, 'r1', 'f1')
     self.lift = newRamp(p .. 'lift', p .. 'lift_val', cfg.channel, CC_LIFT, 'r2', 'f2',
@@ -250,7 +253,7 @@ local function newVessel(cfg)
   local function nE() if self.dE and self.dE ~= 0 then return self.dE end return 1 end
   local function fullFrac() if cfg.full_at then return SET.gfull end return SET.full end   -- the gaiwan can have its own
   local function pourW()                       -- one pour in empty-vessel units
-    if self.dE and self.dE ~= 0 and cfg.pour then return math.abs(cfg.pour / self.dE) end
+    if self.dE and self.dE ~= 0 and self.pour then return math.abs(self.pour / self.dE) end
     return 1
   end
 
@@ -520,6 +523,18 @@ local function newVessel(cfg)
       if h.t >= now - CAPTURE_MS then sum = sum + h.v; n = n + 1 end
     end
     local m = n > 0 and sum / n or self.raw
+    if point == 'full' then
+      -- FULL: the full vessel stands still on the scale after its EMPTY stood there this round:
+      -- one pour = how far it is above that empty reference. Sets the POUR fader.
+      if not (self.N and self.dE) then return end
+      local rw = self.refW or self.emptyW or 1
+      local p = m - self.N - rw * self.dE
+      p = math.floor(math.abs(p) / POUR_STEP + 0.5) * POUR_STEP
+      if p < POUR_MIN or p > POUR_MAX then self.pourMsg = 'out of range'; return end
+      self.pour, self.pourMsg = p, nil
+      if self.ui.pourF then self.ui.pourF.values.x = (p - POUR_MIN) / (POUR_MAX - POUR_MIN) end
+      return
+    end
     if point == 'none' then
       self.N = m
     elseif point == 'empty' then
@@ -539,7 +554,7 @@ local function newVessel(cfg)
 
   function self.serialize()
     local function f(v) return v and string.format('%.1f', v) or '' end
-    return 'v7:' .. f(self.N) .. ',' .. f(self.dE) .. ',' .. self.state
+    return 'v7:' .. f(self.N) .. ',' .. f(self.dE) .. ',' .. self.state .. ',' .. string.format('%d', self.pour or 0)
   end
 
   function self.restore(s)
@@ -552,6 +567,11 @@ local function newVessel(cfg)
       vals[k] = field
     end
     local a, b = tonumber(vals[1] or ''), tonumber(vals[2] or '')
+    local pv = tonumber(vals[4] or '')
+    if tagv == 'v7' and pv and pv >= POUR_MIN and pv <= POUR_MAX then
+      self.pour = pv
+      if self.ui.pourF then self.ui.pourF.values.x = (pv - POUR_MIN) / (POUR_MAX - POUR_MIN) end
+    end
     if tagv == 'v7' or tagv == 'v6' or tagv == 'v5' then
       self.N, self.dE = a, b
       if (tagv == 'v7' or tagv == 'v6') and (vals[3] == 'full' or vals[3] == 'drunk' or vals[3] == 'waiting') then
@@ -564,6 +584,12 @@ local function newVessel(cfg)
   end
 
   function self.tick(now, dt)
+    if self.ui.pourF then                           -- the POUR fader -> self.pour (quantised)
+      local steps = (POUR_MAX - POUR_MIN) / POUR_STEP
+      local pv = POUR_MIN + math.floor(self.ui.pourF.values.x * steps + 0.5) * POUR_STEP
+      if pv ~= self.pour then self.pour = pv; saveAll() end
+      setText(self.ui.pourV, string.format('POUR %d', self.pour))
+    end
     -- the fader is the input: a hand on it sets w (simulation), else it shows w
     if self.isHeld() then
       self.w = self.weightOf(self.ui.out.values.x)
@@ -611,6 +637,7 @@ local function newVessel(cfg)
     end
     setText(u.pts.none, num(self.point('none')))
     setText(u.pts.empty, num(self.point('empty')))
+    setText(u.pts.full, self.pourMsg or (self.pour and string.format('pour %d', self.pour) or '—'))
     self.refreshBattery(now)
   end
 

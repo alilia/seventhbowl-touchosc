@@ -105,7 +105,7 @@ SENSORS = [
          channel=3, pour=185000, gate='pitcher', reset_on_round=True),
     dict(kind='loadcell', id='cup4',    title='CUP 4',   noun='CUP',
          osc='/okuma/cup4',      battery='/okuma/cup4/battery',   color='#4d9ae6',
-         channel=4, pour=1200, gate='pitcher', reset_on_round=True),
+         channel=4, pour=330000, gate='pitcher', reset_on_round=True),
     dict(kind='settings', id='settings', title='SETTINGS', color='#c0c0c8'),
 ]
 
@@ -125,6 +125,7 @@ NOTE_LIFT, NOTE_PUT = 36, 37
 #   gfull  the gaiwan's own FULL (a sensor with full_at): a finger pressing on it read +71k = 0.5 of a
 #          140k pour, a real fill +75k … +180k; 0.6 rejects the finger
 # The defaults are used until a different value is saved in the layout.
+POUR_MIN, POUR_MAX, POUR_STEP = 5000, 500000, 5000   # the per-vessel POUR fader (counts)
 SETTINGS_DEF = [
     ('full',  'FULL',  0.5, 0.1, 0.9, 0.05, 'x'),
     ('drunk', 'DRUNK', 0.5, 0.1, 0.9, 0.05, 'x'),
@@ -216,7 +217,7 @@ BACKGROUND = '#0f0f12'
 DIM_TEXT   = '#8c99a6'
 WHITE      = '#ffffff'
 PARAM      = '#999999'
-POINT_COLORS = {'none': '#596169', 'empty': '#cccccc'}
+POINT_COLORS = {'none': '#596169', 'empty': '#cccccc', 'full': '#e0b84d'}
 
 # ============================================================================
 #  END CONFIG
@@ -429,22 +430,25 @@ def loadcell_column(s, x):
                               'No MIDI.\nOnly counts the rounds: water poured in = +1.', size=11))
     items.append(label(f'{sid}_state', (x + 108, 404, COL_W - 108, 30), 'WAITING', 14, s['color']))
     items.append(label(f'{sid}_last', (x + 108, 434, COL_W - 108, 20), 'last note —' if out else '', 10, DIM_TEXT))
-    points = [('none', f"NO {s['noun']}"), ('empty', f"EMPTY {s['noun']}")]
+    points = [('none', f"NO {s['noun']}"), ('empty', f"EMPTY {s['noun']}"), ('full', f"FULL {s['noun']}")]
     for k, (point, title) in enumerate(points):
-        y = 500 + k * 80
-        text_color = '#000000' if point == 'empty' else WHITE
-        items += labelled_button(f'cap_{sid}_{point}', (x, y, COL_W, 72), POINT_COLORS[point], 'capture',
-                                 [(f'{sid}_{point}_lbl', (0, 8, 28), title, 15, text_color),
-                                  (f'{sid}_{point}_val', (0, 38, 24), '—', 13, text_color)])
+        y = 486 + k * 62
+        text_color = '#000000' if point in ('empty', 'full') else WHITE
+        items += labelled_button(f'cap_{sid}_{point}', (x, y, COL_W, 56), POINT_COLORS[point], 'capture',
+                                 [(f'{sid}_{point}_lbl', (0, 5, 26), title, 15, text_color),
+                                  (f'{sid}_{point}_val', (0, 31, 22), '—', 13, text_color)])
     gate = '   gate: pitcher' if s.get('gate') else ''
     if out:
         midi = (f"ch {s['channel']}: CC{CC_FULL} full · CC{CC_LIFT} lifted\n"
                 f"note {NOTE_LIFT} on lift · {NOTE_PUT} on put-back")
     else:
         midi = 'sends no MIDI'
-    items.append(text_box(f'{sid}_info', (x, 664, COL_W, 120),
-                          f"pour {s['pour']} counts{gate}\n{midi}" +
-                          ("\nresets every round" if s.get('reset_on_round') else ""), size=11))
+    pstart = (s['pour'] - POUR_MIN) / (POUR_MAX - POUR_MIN)
+    items += [label(f'{sid}_pour_val', (x, 674, COL_W, 20), f"POUR {s['pour']}", 13, WHITE, align=0),
+              fader(f'{sid}_pour_f', (x, 696, COL_W, 36), s['color'], pstart)]
+    items.append(text_box(f'{sid}_info', (x, 736, COL_W, 54),
+                          f"counts one pour adds{gate}\n{midi}" +
+                          ("\nresets every round" if s.get('reset_on_round') else ""), size=10))
     return items
 
 
@@ -582,6 +586,7 @@ def render_lua(template):
           for k, _n, d, lo, hi, st, u in SETTINGS_DEF],
         '}',
         f'local MIDI_CONNECTION = {MIDI_CONNECTION}',
+        f'local POUR_MIN, POUR_MAX, POUR_STEP = {POUR_MIN}, {POUR_MAX}, {POUR_STEP}',
         f'local PRESENT_AT = {PRESENT_AT}',
         f'local PRESENT_HYST = {PRESENT_HYST}',
         f'local PRESENT_MS = {PRESENT_MS}',
@@ -682,6 +687,7 @@ def check_config():
             assert s.get('osc_tilt') and s.get('osc_dir'), f"sensor {s['id']} needs osc_tilt and osc_dir"
         else:
             assert s.get('osc'), f"sensor {s['id']} needs an osc address"
+            assert POUR_MIN <= s.get('pour', 0) <= POUR_MAX and s['pour'] % POUR_STEP == 0, f"vessel {s['id']} pour must be a multiple of {POUR_STEP} within the POUR fader"
             assert s.get('pour', 0) > 0, f"vessel {s['id']} needs a pour size in counts"
             assert s.get('gate') in (None, 'pitcher'), f"vessel {s['id']}: gate must be 'pitcher' or absent"
             assert any(t['kind'] == 'tilt' for t in SENSORS) or not s.get('gate'), \
