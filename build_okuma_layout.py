@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-okuma interactive — TouchOSC layout generator (v6)
+okuma interactive — TouchOSC layout generator (v7)
 ==================================================
 
 Builds  okuma_bridge.tosc  (the TouchOSC layout) and
@@ -12,6 +12,8 @@ from the CONFIG section below and the Lua template next to this file.
 
 Only the Python standard library is used.
 
+v7 = cups on their own MIDI channel (CC1 full, CC2 lifted, notes C2 / C3), gaiwan silent,
+rounds + pitcher on channel 16, a SETTINGS column (what "full" / "drunk" mean, ramp times).
 v6 = vessels as on/off states (present / full / drunk) with ramps, the level fader as
 input (OSC or a hand), pitcher gate, negative rounds.
 v5 = v4 + fill by EVENTS (pour / sip) instead of by weight, steps stored as offsets,
@@ -55,11 +57,10 @@ from pathlib import Path
 OUTPUT_NAME  = 'okuma_bridge'                 # -> .tosc and .lua
 LUA_TEMPLATE = 'okuma_bridge.template.lua'
 
-MIDI_CHANNEL = 1                                 # 1–16
 MIDI_CONNECTION = 1                              # TouchOSC connection used for MIDI out
 
 # Order = order on screen (follows the performance).
-#   kind     'loadcell', 'tilt' or 'rounds'
+#   kind     'loadcell', 'tilt', 'rounds' or 'settings'
 #   id       internal name, used in control names (letters/digits only)
 #   title    shown on top of the group
 #   noun     load cells: used on the first button ("NO <noun>")
@@ -67,15 +68,13 @@ MIDI_CONNECTION = 1                              # TouchOSC connection used for 
 #   osc_tilt, osc_dir   'tilt' only: the module's total tilt (0–180°) and lean direction (0–360°)
 #   battery  incoming battery address (0–100 %) — placeholder until decided
 #   source   'rounds' only: the id of the load cell whose "full" it counts
-#   cc       vessels: CC of FULL (on = more full than empty); pitcher: CC of its tilt fader;
-#            rounds: not sent (kept for the order). Fixed accessories first (gaiwan 20,
-#            rounds 21, pitcher 22), cups last (23+) — the v4 / v5 fill numbers
-#   present_cc  vessels: CC of PRESENT (on = on the scale) — the v4 / v5 lift numbers
-#               (cups 1–4, gaiwan 5); note: 127 now means ON the scale
-#   drunk_cc    vessels: CC of DRUNK (on = an empty vessel that was drunk) — new:
-#               10 + the vessel's position in the fill order (gaiwan 10, cups 13–16)
+#   channel  MIDI channel (1–16). Cups: their own channel. Rounds / pitcher: channel 16.
+#            A vessel WITHOUT a channel (the gaiwan) sends no MIDI at all
+#   cc       pitcher only: CC of its tilt fader (30). Cups use CC_FULL / CC_LIFT below
 #   pour     vessels: the weight of one pour in counts (the rise a pour gives). From the
-#            2026-10-29 log; a pour counts at POUR_FRACTION of it
+#            2026-10-29 log; a pour counts at the FULL AT fraction of it (a setting)
+#   full_at  optional: this vessel's own FULL fraction instead of the FULL setting. The gaiwan 0.6:
+#            a finger pressing on it read +71k, real fills +95k … +180k above empty
 #   pour_hold  optional: own POUR_HOLD_S (the gaiwan waits longer: lid and hands)
 #   gate     'pitcher': this vessel can only become full while the pitcher pours (or
 #            GATE_S after). Cups only: the gaiwan's water comes from the kettle
@@ -84,29 +83,56 @@ MIDI_CONNECTION = 1                              # TouchOSC connection used for 
 #   tare_band       optional: own TARE_BAND. Gaiwan 0.3: its empty scale drifted 83k counts in the
 #                   40-minute log (0.47 of the gaiwan), 10–30k between two pour-outs
 #   note     'rounds' only: the note of round 0; round n sends note + n, below 0 sends
-#            note (note-on, velocity 127, channel MIDI_CHANNEL; no note-off, no CC)
+#            note (note-on, velocity 127, no note-off, no CC)
 #   color    hex colour of the group
 SENSORS = [
     dict(kind='loadcell', id='gaiwan',  title='GAIWAN',  noun='GAIWAN',
          osc='/okuma/gaiwan',    battery='/okuma/gaiwan/battery', color='#d39b4a',
-         cc=20, present_cc=5, drunk_cc=10, pour=100000, pour_hold=1.0, tare_band=0.3),
+         pour=140000, full_at=0.6, tare_band=0.3),
     dict(kind='rounds',   id='rounds',  title='ROUNDS',  source='gaiwan',
-         cc=21, note=0, color='#e6c84d'),
+         channel=16, note=0, color='#e6c84d'),
     dict(kind='tilt',     id='pitcher', title='PITCHER',
          osc_tilt='/okuma/imu1/tilt', osc_dir='/okuma/imu1/dir',
-         battery='/okuma/imu1/battery',                          cc=22, color='#9a80f2'),
+         battery='/okuma/imu1/battery',                          channel=16, cc=30, color='#9a80f2'),
     dict(kind='loadcell', id='cup1',    title='CUP 1',   noun='CUP',
          osc='/okuma/cup1',      battery='/okuma/cup1/battery',   color='#33bfb3',
-         cc=23, present_cc=1, drunk_cc=13, pour=170000, gate='pitcher', reset_on_round=True),
+         channel=1, pour=170000, gate='pitcher', reset_on_round=True),
     dict(kind='loadcell', id='cup2',    title='CUP 2',   noun='CUP',
          osc='/okuma/cup2',      battery='/okuma/cup2/battery',   color='#8ccc4d',
-         cc=24, present_cc=2, drunk_cc=14, pour=125000, gate='pitcher', reset_on_round=True),
+         channel=2, pour=125000, gate='pitcher', reset_on_round=True),
     dict(kind='loadcell', id='cup3',    title='CUP 3',   noun='CUP',
          osc='/okuma/cup3',      battery='/okuma/cup3/battery',   color='#e66673',
-         cc=25, present_cc=3, drunk_cc=15, pour=185000, gate='pitcher', reset_on_round=True),
+         channel=3, pour=185000, gate='pitcher', reset_on_round=True),
     dict(kind='loadcell', id='cup4',    title='CUP 4',   noun='CUP',
          osc='/okuma/cup4',      battery='/okuma/cup4/battery',   color='#4d9ae6',
-         cc=26, present_cc=4, drunk_cc=16, pour=1200, gate='pitcher', reset_on_round=True),
+         channel=4, pour=1200, gate='pitcher', reset_on_round=True),
+    dict(kind='settings', id='settings', title='SETTINGS', color='#c0c0c8'),
+]
+
+# Cup MIDI (on the cup's own channel)
+#   CC_FULL   0 = empty / waiting / drunk, 127 = poured and not yet drunk
+#   CC_LIFT   0 = on the scale, 127 = lifted off
+#   NOTE_LIFT note-on + note-off together when the cup is lifted   (36)
+#   NOTE_PUT  note-on + note-off together when it is put back      (37)
+CC_FULL, CC_LIFT = 1, 2
+NOTE_LIFT, NOTE_PUT = 36, 37
+
+# The faders in the SETTINGS column: key, short name, default, min, max, step, unit.
+#   full   "FULL AT": a pour counts as full when the rise is this fraction of the vessel's pour
+#   drunk  "DRUNK AT": a full vessel put back lighter by this fraction of what was poured = drunk
+#   r1 f1  CC1 (full) ramp: seconds 0 -> 127 and 127 -> 0 (0 = jump); shared by all cups
+#   r2 f2  CC2 (lifted) ramp, the same
+#   gfull  the gaiwan's own FULL (a sensor with full_at): a finger pressing on it read +71k = 0.5 of a
+#          140k pour, a real fill +75k … +180k; 0.6 rejects the finger
+# The defaults are used until a different value is saved in the layout.
+SETTINGS_DEF = [
+    ('full',  'FULL',  0.5, 0.1, 0.9, 0.05, 'x'),
+    ('drunk', 'DRUNK', 0.5, 0.1, 0.9, 0.05, 'x'),
+    ('r1',    '↑CC1',  3.0, 0.0, 10.0, 0.5, 's'),
+    ('f1',    '↓CC1',  3.0, 0.0, 10.0, 0.5, 's'),
+    ('r2',    '↑CC2',  3.0, 0.0, 10.0, 0.5, 's'),
+    ('f2',    '↓CC2',  3.0, 0.0, 10.0, 0.5, 's'),
+    ('gfull', 'GAIW', 0.6, 0.3, 1.0, 0.05, 'x'),
 ]
 
 # Vessels (gaiwan, cups). Weights in empty-vessel units w: 0 = nothing on the scale,
@@ -118,10 +144,16 @@ SENSORS = [
 #   SETTLE_MS      still this long after a put-down = settled (the drunk test and the
 #                  reference are taken then)
 #   POUR_HOLD_S    a rise must stay still this long to count as a pour
-#   POUR_FRACTION  a pour = a rise of at least this fraction of the vessel's `pour`
 #   DRIFT_FRACTION a still rise below this fraction of `pour` is drift (the base follows)
-#   DRINK_FRACTION a FULL vessel back from the lips lighter by at least this fraction of what
-#                  was poured = DRUNK
+#   REARM          the round counter's vessel (gaiwan) is full above empty + FULL × pour and counts
+#                  again only after it falls back below empty + REARM × pour (or is emptied away)
+#   PUSH_POURS     the gaiwan: a rise of more than this many pours above empty is a push or a hand,
+#                  not water (never counted)
+#   LIFT_STEP      a cup is LIFTED when its weight drops this much (in empty-cup units) within
+#                  LIFT_WIN_MS from a loaded weight, PUT BACK when it rises this much from the
+#                  trough: the note comes with the movement, not at the half-way line
+#   EMPTY_WIN_S    the gaiwan's empty level = the highest settled non-full weight of the last
+#                  EMPTY_WIN_S s (a lid off-and-on or a small drift is not a pour)
 #   GATE_S         the pitcher gate stays open this long after the pitcher stops pouring
 #   GATE_SILENT_S  a pitcher that has sent nothing (and was not touched) this long opens the
 #                  gate, so the cups still work on weight alone
@@ -131,17 +163,14 @@ PRESENT_MS     = 100
 STILL_BAND     = 0.03
 SETTLE_MS      = 300
 POUR_HOLD_S    = 0.5
-POUR_FRACTION  = 0.5
 DRIFT_FRACTION = 0.15
-DRINK_FRACTION = 0.5
 GATE_S         = 5
+REARM          = 0.25
+PUSH_POURS     = 1.4
+LIFT_STEP      = 0.2
+LIFT_WIN_MS    = 400
+EMPTY_WIN_S    = 60
 GATE_SILENT_S  = 10
-
-# Output ramps: every vessel output is on/off and moves linearly to its new value.
-# Seconds for 0 -> 127 (RISE) and 127 -> 0 (FALL); 0 = jump. Shared by all vessels.
-PRESENT_RISE_S, PRESENT_FALL_S = 3.0, 3.0
-FULL_RISE_S,    FULL_FALL_S    = 3.0, 3.0
-DRUNK_RISE_S,   DRUNK_FALL_S   = 3.0, 3.0
 
 # Auto-tare (all vessels): away, within TARE_BAND of NO and still for TARE_HOLD_S seconds ->
 # that reading becomes the new NO; everything remembered moves with it. A vessel's
@@ -171,12 +200,13 @@ ZERO pose; below {thr}° -> 0. ZERO with
 the pitcher resting. Pouring opens the
 cups' gate for {gate:g} s.
 
-Vessels: capture NO and EMPTY, vessel
-in the MIDDLE. The big fader is the
-input: 0 away, middle = empty (this
-round), top = one pour. Drag it to test
-without sensors. PRESENT / FULL /
-DRUNK = CCs, ramped; tap to force.
+Cups: capture NO and EMPTY, cup in the
+MIDDLE. The big fader is the input: 0
+away, middle = empty (this round), top
+= one pour. Drag it to test without
+sensors. FULL / LIFTED = CCs, ramped;
+tap to force. Tapping LIFTED fires the
+lift / put note (C2 / C3).
 Battery: 0–100 on <module>/battery"""
 
 # Look
@@ -260,14 +290,14 @@ def node(kind, properties, values, messages=''):
             f'<values>{values}</values>{messages}</node>')
 
 
-def midi_cc_message(cc):
-    """MIDI CC on MIDI_CHANNEL, value = control x scaled 0–127, sent on any change."""
+def midi_cc_message(cc, channel):
+    """MIDI CC on `channel` (1–16), value = control x scaled 0–127, sent on any change."""
     connections = ''.join('1' if i == MIDI_CONNECTION else '0' for i in range(10, 0, -1))
     return (
         '<messages><midi><enabled>1</enabled><send>1</send><receive>0</receive>'
         f'<feedback>0</feedback><noDuplicates>1</noDuplicates><connections>{connections}</connections>'
         f'<triggers><trigger><var>{cdata("x")}</var><condition>ANY</condition></trigger></triggers>'
-        f'<message><type>CONTROLCHANGE</type><channel>{MIDI_CHANNEL - 1}</channel>'
+        f'<message><type>CONTROLCHANGE</type><channel>{channel - 1}</channel>'
         f'<data1>{cc}</data1><data2>0</data2></message><values>'
         f'<value><type>CONSTANT</type><key>{cdata("")}</key><scaleMin>0</scaleMin><scaleMax>15</scaleMax></value>'
         f'<value><type>CONSTANT</type><key>{cdata("")}</key><scaleMin>0</scaleMin><scaleMax>1</scaleMax></value>'
@@ -278,8 +308,8 @@ def midi_cc_message(cc):
 # ---------------------------------------------------------------------------
 #  Controls
 # ---------------------------------------------------------------------------
-def fader(name, frame, color, default=0.0, cc=None, grid=False, grid_steps=10):
-    """Vertical fader. With cc it sends MIDI; touchable either way."""
+def fader(name, frame, color, default=0.0, cc=None, channel=1, grid=False, grid_steps=10):
+    """Vertical fader. With cc it sends MIDI on `channel`; touchable either way."""
     props = base_props(name, frame, rgba(color)) + ''.join([
         prop('b', 'bar', True), prop('i', 'barDisplay', 0), prop('b', 'cursor', True),
         prop('i', 'cursorDisplay', 0), prop('b', 'grid', grid),
@@ -287,7 +317,7 @@ def fader(name, frame, color, default=0.0, cc=None, grid=False, grid_steps=10):
         prop('i', 'response', 0), prop('i', 'responseFactor', 100),
     ])
     return node('FADER', props, value('x', default) + TOUCH_VALUE,
-                midi_cc_message(cc) if cc is not None else '')
+                midi_cc_message(cc, channel) if cc is not None else '')
 
 
 def label(name, frame, text, size=14, color=WHITE, align=2, background=None):
@@ -322,14 +352,14 @@ def button(name, frame, color, notify_key, background=True):
     return node('BUTTON', props, value('x', 0) + TOUCH_VALUE)
 
 
-def toggle(name, frame, color, cc=None):
-    """Toggle button (on press) that carries its own MIDI CC: on = 127, off = 0.
+def toggle(name, frame, color):
+    """Toggle button (on press): lit = on. The script sends the CC (ramped).
     No background, so the text underneath stays readable; lit (filled) when on."""
     props = base_props(name, frame, color, background=False) + ''.join([
         prop('i', 'buttonType', 2), prop('b', 'press', True), prop('b', 'release', True),
         prop('b', 'valuePosition', False),
     ])
-    return node('BUTTON', props, value('x', 0) + TOUCH_VALUE, midi_cc_message(cc) if cc is not None else '')
+    return node('BUTTON', props, value('x', 0) + TOUCH_VALUE)
 
 
 def labelled_button(name, frame, color, notify_key, texts):
@@ -353,7 +383,10 @@ def header(s, x, with_clear):
     """Title, clear button, battery and status lines — shared by all columns."""
     sid = s['id']
     title_w = COL_W - 70 if with_clear else COL_W
-    title = s['title'] if s['kind'] == 'loadcell' else f"{s['title']}   CC {s['cc']}"
+    if s['kind'] == 'loadcell':
+        title = f"{s['title']}  ch {s['channel']}" if s.get('channel') else f"{s['title']}  (silent)"
+    else:
+        title = f"{s['title']}  ch {s['channel']}  CC {s['cc']}"
     out = [label(f'{sid}_title', (x, 15, title_w, 36), title, 18, s['color'], align=0)]
     if with_clear:
         out += labelled_button(f'clr_{sid}', (x + COL_W - 60, 18, 60, 30), '#4d4d4d', 'clear',
@@ -369,28 +402,33 @@ def output(s, x):
     if s['kind'] == 'loadcell':        # the level fader: input, no MIDI; line at the middle (= empty)
         return [fader(f'{sid}_out', (x + 5, 138, 100, 320), s['color'], 0, grid=True, grid_steps=2),
                 label(f'{sid}_outval', (x, 464, COL_W, 28), '—', 13, WHITE, align=0)]
-    return [fader(f'{sid}_out', (x + 5, 138, 100, 320), s['color'], 0, cc=None if s['kind'] == 'rounds' else s['cc']),
+    return [fader(f'{sid}_out', (x + 5, 138, 100, 320), s['color'], 0, cc=None if s['kind'] == 'rounds' else s['cc'],
+                  channel=s.get('channel', 1)),
             label(f'{sid}_outval', (x, 464, COL_W, 28), 'MIDI —', 14, WHITE, align=0)]
 
 
 def loadcell_column(s, x):
-    """Vessel: level fader (input), PRESENT / FULL / DRUNK tap toggles (CC ramps), state,
-    NO / EMPTY captures."""
+    """Vessel: level fader (input), CC1 / CC2 tap toggles (cups) + note buttons, state,
+    NO / EMPTY captures. The gaiwan has no outputs, so it only shows its state."""
     sid = s['id']
-    rx, rw = x + 112, COL_W - 112
+    out = s.get('channel') is not None
     items = header(s, x, with_clear=True) + output(s, x) + [
         label(f'{sid}_lv_full', (x + 108, 132, 46, 16), '← full', 10, DIM_TEXT, align=0),
         label(f'{sid}_lv_empty', (x + 108, 290, 46, 16), '← empty', 10, DIM_TEXT, align=0),
         label(f'{sid}_lv_away', (x + 108, 442, 46, 16), '← away', 10, DIM_TEXT, align=0),
     ]
-    for k, (out, cc) in enumerate([('present', s['present_cc']), ('full', s['cc']),
-                                   ('drunk', s['drunk_cc'])]):
-        frame = (x + 154, 156 + k * 82, COL_W - 154, 72)
-        items += [label(f'{sid}_{out}_box', frame, '', 12, WHITE, background='#26262c'),
-                  label(f'{sid}_{out}_name', (frame[0], frame[1] + 8, frame[2], 24), out.upper(), 12, WHITE),
-                  label(f'{sid}_{out}_val', (frame[0], frame[1] + 38, frame[2], 22), f'CC {cc} = 0', 10, DIM_TEXT),
-                  toggle(f'{sid}_{out}', frame, rgba(s['color'], 0.55))]
+    if out:
+        for k, (name, title, cc) in enumerate([('full', 'FULL', CC_FULL), ('lift', 'LIFTED', CC_LIFT)]):
+            frame = (x + 154, 150 + k * 70, COL_W - 154, 64)
+            items += [label(f'{sid}_{name}_box', frame, '', 12, WHITE, background='#26262c'),
+                      label(f'{sid}_{name}_name', (frame[0], frame[1] + 6, frame[2], 24), title, 12, WHITE),
+                      label(f'{sid}_{name}_val', (frame[0], frame[1] + 34, frame[2], 22), f'CC {cc} = 0', 10, DIM_TEXT),
+                      toggle(f'{sid}_{name}', frame, rgba(s['color'], 0.55))]
+    else:
+        items.append(text_box(f'{sid}_silent', (x + 154, 150, COL_W - 154, 120),
+                              'No MIDI.\nOnly counts the rounds: water poured in = +1.', size=11))
     items.append(label(f'{sid}_state', (x + 108, 404, COL_W - 108, 30), 'WAITING', 14, s['color']))
+    items.append(label(f'{sid}_last', (x + 108, 434, COL_W - 108, 20), 'last note —' if out else '', 10, DIM_TEXT))
     points = [('none', f"NO {s['noun']}"), ('empty', f"EMPTY {s['noun']}")]
     for k, (point, title) in enumerate(points):
         y = 500 + k * 80
@@ -399,11 +437,44 @@ def loadcell_column(s, x):
                                  [(f'{sid}_{point}_lbl', (0, 8, 28), title, 15, text_color),
                                   (f'{sid}_{point}_val', (0, 38, 24), '—', 13, text_color)])
     gate = '   gate: pitcher' if s.get('gate') else ''
+    if out:
+        midi = (f"ch {s['channel']}: CC{CC_FULL} full · CC{CC_LIFT} lifted\n"
+                f"note {NOTE_LIFT} on lift · {NOTE_PUT} on put-back")
+    else:
+        midi = 'sends no MIDI'
     items.append(text_box(f'{sid}_info', (x, 664, COL_W, 120),
-                          f"pour {s['pour']} counts{gate}\n"
-                          f"FULL CC {s['cc']} · PRESENT CC {s['present_cc']}\n"
-                          f"DRUNK CC {s['drunk_cc']}" +
+                          f"pour {s['pour']} counts{gate}\n{midi}" +
                           ("\nresets every round" if s.get('reset_on_round') else ""), size=11))
+    return items
+
+
+def settings_column(s, x):
+    """SETTINGS: one vertical fader per SETTINGS_DEF entry, with its name and value."""
+    n = len(SETTINGS_DEF)
+    w = COL_W // n
+    items = [label(f'{s["id"]}_title', (x, 15, COL_W, 36), s['title'], 18, s['color'], align=0)]
+    for k, (key, name, default, lo, hi, step, unit) in enumerate(SETTINGS_DEF):
+        fx = x + k * w
+        start = (default - lo) / (hi - lo)
+        steps = int(round((hi - lo) / step))
+        items += [label(f'settings_n_{key}', (fx, 110, w, 20), name, 10, DIM_TEXT),
+                  fader(f'settings_f_{key}', (fx + 3, 138, w - 6, 270), s['color'], start, grid=True,
+                        grid_steps=steps if steps <= 20 else 10),
+                  label(f'settings_v_{key}', (fx, 412, w, 20), '—', 11, WHITE)]
+    items.append(text_box('settings_note', (x, 450, COL_W, 334),
+                          """FULL: a cup counts as full when
+the rise is this fraction of a pour
+(0.5 = half full).
+DRUNK: a full cup put back
+lighter by this fraction of what
+was poured = drunk (CC1 -> 0).
+
+CC1 / CC2 ramps: seconds for
+0 -> 127 (↑) and 127 -> 0 (↓),
+0 = jump. The same for all cups.
+Notes are immediate.
+
+Saved with the layout."""))
     return items
 
 
@@ -414,7 +485,7 @@ def tilt_column(s, x):
     rx = x + 178
     steps = (RANGE_MAX - RANGE_MIN) // RANGE_STEP
     range_default = round((RANGE_DEFAULT - RANGE_MIN) / RANGE_STEP) / steps
-    note = NOTE.format(ch=MIDI_CHANNEL, thr=f'{POUR_THRESHOLD:g}', gate=GATE_S)
+    note = NOTE.format(ch=s['channel'], thr=f'{POUR_THRESHOLD:g}', gate=GATE_S)
     items = header(s, x, with_clear=False) + output(s, x) + [
         label(f'{sid}_in_tilt', (px, 138, pw, 22), 'in —', 11, DIM_TEXT, align=0),
         label(f'{sid}_in_dir', (px, 162, pw, 22), 'dir —', 11, DIM_TEXT, align=0),
@@ -453,7 +524,7 @@ into the {s['source']}. Starts at 0;
 −1 below 0 = a warming round.
 
 Every change sends one MIDI
-note-on, channel {MIDI_CHANNEL}, velocity 127
+note-on, channel {s['channel']}, velocity 127
 (no note-off, no CC):
 note {s['note']} = round 0 and below,
 {s['note'] + 1} = round 1 …
@@ -465,7 +536,8 @@ The fader only shows the count."""))
     return items
 
 
-COLUMN_BUILDERS = {'loadcell': loadcell_column, 'tilt': tilt_column, 'rounds': rounds_column}
+COLUMN_BUILDERS = {'loadcell': loadcell_column, 'tilt': tilt_column, 'rounds': rounds_column,
+                   'settings': settings_column}
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +560,7 @@ def render_lua(template):
             fields.append(f"source = {lua_string(s['source'])}")
         if s.get('battery'):
             fields.append(f"battery = {lua_string(s['battery'])}")
-        for key in ('cc', 'present_cc', 'drunk_cc', 'pour', 'pour_hold', 'tare_band'):
+        for key in ('channel', 'cc', 'pour', 'pour_hold', 'tare_band', 'full_at'):
             if s.get(key) is not None:
                 fields.append(f"{key} = {s[key]}")
         if s.get('gate'):
@@ -503,7 +575,12 @@ def render_lua(template):
         'local SENSORS = {',
         *rows,
         '}',
-        f'local MIDI_CHANNEL = {MIDI_CHANNEL}',
+        f'local CC_FULL, CC_LIFT = {CC_FULL}, {CC_LIFT}',
+        f'local NOTE_LIFT, NOTE_PUT = {NOTE_LIFT}, {NOTE_PUT}',
+        'local SETTINGS_DEF = {',
+        *[f"  {{ key = {lua_string(k)}, default = {d}, min = {lo}, max = {hi}, step = {st}, unit = {lua_string(u)} }},"
+          for k, _n, d, lo, hi, st, u in SETTINGS_DEF],
+        '}',
         f'local MIDI_CONNECTION = {MIDI_CONNECTION}',
         f'local PRESENT_AT = {PRESENT_AT}',
         f'local PRESENT_HYST = {PRESENT_HYST}',
@@ -511,17 +588,12 @@ def render_lua(template):
         f'local STILL_BAND = {STILL_BAND}',
         f'local SETTLE_MS = {SETTLE_MS}',
         f'local POUR_HOLD_S = {POUR_HOLD_S}',
-        f'local POUR_FRACTION = {POUR_FRACTION}',
         f'local DRIFT_FRACTION = {DRIFT_FRACTION}',
-        f'local DRINK_FRACTION = {DRINK_FRACTION}',
         f'local GATE_S = {GATE_S}',
+        f'local REARM = {REARM}',
+        f'local PUSH_POURS = {PUSH_POURS}',
+        f'local LIFT_STEP, LIFT_WIN_MS, EMPTY_WIN_S = {LIFT_STEP}, {LIFT_WIN_MS}, {EMPTY_WIN_S}',
         f'local GATE_SILENT_S = {GATE_SILENT_S}',
-        f'local PRESENT_RISE_S = {PRESENT_RISE_S}',
-        f'local PRESENT_FALL_S = {PRESENT_FALL_S}',
-        f'local FULL_RISE_S = {FULL_RISE_S}',
-        f'local FULL_FALL_S = {FULL_FALL_S}',
-        f'local DRUNK_RISE_S = {DRUNK_RISE_S}',
-        f'local DRUNK_FALL_S = {DRUNK_FALL_S}',
         f'local TARE_BAND = {TARE_BAND}',
         f'local TARE_HOLD_S = {TARE_HOLD_S}',
         f'local ROUND_MIN_GAP_S = {ROUND_MIN_GAP_S}',
@@ -560,15 +632,32 @@ def build_document(lua):
 def check_config():
     ids = [s['id'] for s in SENSORS]
     assert len(set(ids)) == len(ids), f'duplicate sensor id in {ids}'
-    ccs = []
+    assert 1 <= MIDI_CONNECTION <= 10, 'MIDI connection 1–10'
+    assert CC_FULL != CC_LIFT and all(0 <= c <= 127 for c in (CC_FULL, CC_LIFT)), 'cup CCs 0–127, different'
+    assert all(0 <= n <= 127 for n in (NOTE_LIFT, NOTE_PUT)), 'notes 0–127'
+    used = {}                       # (channel, 'cc' / 'note', number) -> who
+    def use(key, who):
+        assert key not in used, f'{who} and {used[key]} both send {key}'
+        used[key] = who
     for s in SENSORS:
-        if s['kind'] == 'loadcell':
-            ccs += [s['cc'], s['present_cc'], s['drunk_cc']]
+        ch = s.get('channel')
+        assert ch is None or (isinstance(ch, int) and 1 <= ch <= 16), f"{s['id']}: channel 1–16"
+        if s['kind'] == 'loadcell' and ch:
+            use((ch, 'cc', CC_FULL), s['id']); use((ch, 'cc', CC_LIFT), s['id'])
+            use((ch, 'note', NOTE_LIFT), s['id'])
+            if NOTE_PUT != NOTE_LIFT:
+                use((ch, 'note', NOTE_PUT), s['id'])
         elif s['kind'] == 'tilt':
-            ccs.append(s['cc'])
-    assert len(set(ccs)) == len(ccs), f'duplicate CC in {sorted(ccs)}'
-    assert all(isinstance(c, int) and 0 <= c <= 127 for c in ccs), f'CC out of range in {ccs}'
-    assert 1 <= MIDI_CHANNEL <= 16 and 1 <= MIDI_CONNECTION <= 10, 'MIDI channel 1–16, connection 1–10'
+            assert ch and 0 <= s['cc'] <= 127, 'pitcher needs a channel and a CC'
+            use((ch, 'cc', s['cc']), s['id'])
+        elif s['kind'] == 'rounds':
+            assert ch, 'rounds needs a channel'
+    keys = [d[0] for d in SETTINGS_DEF]
+    assert keys == ['full', 'drunk', 'r1', 'f1', 'r2', 'f2', 'gfull'], 'SETTINGS_DEF keys are fixed by the script'
+    for key, _n, d, lo, hi, st, _u in SETTINGS_DEF:
+        assert lo <= d <= hi and st > 0 and abs((hi - lo) / st - round((hi - lo) / st)) < 1e-6 \
+            and abs((d - lo) / st - round((d - lo) / st)) < 1e-6, f'setting {key}: default/min/max/step must fit'
+    assert 0 < SETTINGS_DEF[0][3] and SETTINGS_DEF[0][4] <= 1 and SETTINGS_DEF[1][4] <= 1, 'fractions within 0–1'
     assert 0 <= POUR_THRESHOLD < RANGE_DEFAULT and RANGE_MIN <= RANGE_DEFAULT <= RANGE_MAX, \
         'need 0 <= POUR_THRESHOLD < RANGE_DEFAULT and RANGE_MIN <= RANGE_DEFAULT <= RANGE_MAX'
     assert (RANGE_MAX - RANGE_MIN) % RANGE_STEP == 0 and (RANGE_DEFAULT - RANGE_MIN) % RANGE_STEP == 0, \
@@ -576,14 +665,13 @@ def check_config():
     assert 0 < PRESENT_HYST < PRESENT_AT < 1, 'need 0 < PRESENT_HYST < PRESENT_AT < 1'
     assert 0 <= TARE_BAND < PRESENT_AT - PRESENT_HYST and TARE_HOLD_S >= 0, \
         'need 0 <= TARE_BAND < PRESENT_AT - PRESENT_HYST, TARE_HOLD_S >= 0'
-    assert 0 < DRIFT_FRACTION < POUR_FRACTION <= 1 and 0 < DRINK_FRACTION <= 1, \
-        'need 0 < DRIFT_FRACTION < POUR_FRACTION <= 1 and 0 < DRINK_FRACTION <= 1'
+    assert 0 < DRIFT_FRACTION < 1, 'need 0 < DRIFT_FRACTION < 1'
     assert min(PRESENT_MS, SETTLE_MS, POUR_HOLD_S, GATE_S, GATE_SILENT_S, STILL_BAND) >= 0
-    assert min(PRESENT_RISE_S, PRESENT_FALL_S, FULL_RISE_S, FULL_FALL_S,
-               DRUNK_RISE_S, DRUNK_FALL_S) >= 0, 'ramp times must be 0 or more'
     for s in SENSORS:
         assert s['kind'] in COLUMN_BUILDERS, f"unknown kind {s['kind']}"
         assert s['id'].isalnum(), f"id must be letters/digits: {s['id']}"
+        if s['kind'] == 'settings':
+            continue
         if s['kind'] == 'rounds':
             assert s.get('source') in ids, f"rounds source {s.get('source')!r} is not a sensor id"
             assert [t for t in SENSORS if t['id'] == s['source']][0]['kind'] == 'loadcell', \
